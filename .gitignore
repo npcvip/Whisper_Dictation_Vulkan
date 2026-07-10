@@ -1,0 +1,111 @@
+# Виртуальное окружение Python
+.venv/
+venv/
+env/
+ENV/
+
+# Токены и секреты
+GITHUB_TOKEN.env
+*.env
+.env.*
+
+# Кэш и зависимости Python
+__pycache__/
+*.py[cod]
+*.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Node.js зависимости
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# VS Code настройки (кроме важных)
+.vscode/*
+!.vscode/mcp.json
+!.vscode/settings.json
+
+# Continue конфиг (сохраняем)
+!.continue/
+
+# Логи
+logs/
+*.log
+*.debug.log
+
+# Сырые данные и обработанные файлы (Feather формат)
+data/raw/*.feather
+data/processed/*.feather
+# Прогресс загрузки
+data/.download_progress.json
+# Сохраняем Python-модули в data/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Тесты и кэш
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.jupyter/
+hypothesis_/
+
+# IDE проекты
+.idea/
+*.iml
+.project
+.classpath
+.settings/
+
+# Временные файлы
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+*~
+
+# Docker
+docker-compose.override.yml
+.docker/
+
+# LM Studio кэш
+.lmstudio/
+.cline
+.clinerules
+.continue
+/scripts
+/tools
+/open_project.cmd
+/setup_project.cmd
+/pyproject.toml
+/gui_log.txt
+.deps_installed
+ggml-large-v3-turbo-q8_0.bin
+
+
+# Бэкапы
+/Backups/

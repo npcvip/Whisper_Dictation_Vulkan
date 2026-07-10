@@ -1,0 +1,8 @@
+pyaudio
+pyautogui
+pyperclip
+pystray
+pillow
+pynput
+keyboard
+requests
