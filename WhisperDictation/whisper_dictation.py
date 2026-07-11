@@ -11,6 +11,7 @@ from pathlib import Path
 import logging
 
 import pyaudio
+import webrtcvad
 import pyautogui
 import pyperclip
 import pystray
@@ -38,9 +39,42 @@ except ImportError:
     kb = None
 
 # ----------------------------------------------------------------------
-# Логирование
+# Динамическое определение путей
+# RESOURCE_DIR — чтение ресурсов (whisper-cli, модели) — рядом с EXE
+# DATA_DIR    — запись данных (конфиг, логи, записи) — %APPDATA%
 # ----------------------------------------------------------------------
-LOG_PATH = Path(r"C:\WhisperDictation\error.log")
+def get_resource_dir():
+    """Путь к ресурсам программы — работает и в разработке, и в собранном EXE."""
+    try:
+        # PyInstaller 6.0+ — файлы в _internal, путь в _MEIPASS
+        return Path(sys._MEIPASS)
+    except AttributeError:
+        # Запущено как скрипт
+        return Path(__file__).parent
+
+RESOURCE_DIR = get_resource_dir()
+
+# DATA_DIR — пользовательские данные в %APPDATA%\WhisperDictation
+APPDATA_DIR = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
+DATA_DIR = APPDATA_DIR / "WhisperDictation"
+
+# ----------------------------------------------------------------------
+# Пути к данным (запись) — в DATA_DIR
+# ----------------------------------------------------------------------
+CONFIG_PATH = DATA_DIR / "config.ini"
+RECORDINGS_DIR = DATA_DIR / "recordings"
+TEMP_WAV = RECORDINGS_DIR / "temp_record.wav"
+CHUNK_DIR = RECORDINGS_DIR / "chunks"
+LOG_PATH = DATA_DIR / "error.log"
+
+# Создаём папки ДО настройки логирования
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+CHUNK_DIR.mkdir(parents=True, exist_ok=True)
+
+# ----------------------------------------------------------------------
+# Логирование (ПОСЛЕ создания папок)
+# ----------------------------------------------------------------------
 logging.basicConfig(
     filename=LOG_PATH,
     level=logging.DEBUG,
@@ -49,27 +83,25 @@ logging.basicConfig(
 )
 
 # ----------------------------------------------------------------------
-# Константы и пути
+# Утилита для путей
 # ----------------------------------------------------------------------
-BASE_DIR = Path(r"C:\WhisperDictation")
-CONFIG_PATH = BASE_DIR / "config.ini"
-RECORDINGS_DIR = BASE_DIR / "recordings"
-TEMP_WAV = RECORDINGS_DIR / "temp_record.wav"
-CHUNK_DIR = RECORDINGS_DIR / "chunks"
-
-RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
-CHUNK_DIR.mkdir(parents=True, exist_ok=True)
+def resolve_path(path_str):
+    """Если путь относительный — добавить RESOURCE_DIR (для чтения ресурсов)."""
+    p = Path(path_str)
+    if p.is_absolute():
+        return str(p)
+    return str(RESOURCE_DIR / p)
 
 # ----------------------------------------------------------------------
-# Конфигурация
+# Конфигурация (относительные пути)
 # ----------------------------------------------------------------------
 DEFAULT_CONFIG = {
     "Paths": {
-        "whisper_gpu": str(BASE_DIR / "whisper-vulkan" / "whisper-cli.exe"),
-        "whisper_cpu": str(BASE_DIR / "whisper-CPU" / "whisper-cli.exe"),
-        "model": str(BASE_DIR / "models" / "ggml-large-v3-turbo-q8_0.bin"),
+        "whisper_gpu": "whisper-vulkan\\whisper-cli.exe",
+        "whisper_cpu": "whisper-CPU\\whisper-cli.exe",
+        "model": "models\\ggml-large-v3-turbo-q8_0.bin",
         "gpu_device_index": "1",
-        "server_path": str(BASE_DIR / "whisper-server-vulkan" / "whisper-server.exe"),
+        "server_path": "whisper-vulkan-Server\\whisper-server.exe",
     },
     "Recognition": {
         "device": "gpu",
@@ -77,6 +109,7 @@ DEFAULT_CONFIG = {
         "language": "ru",
         "method": "whisper-server",   # "whisper-cli" или "whisper-server"
         "server_url": "http://127.0.0.1:8080/inference",
+        "use_vad": "false",
     },
     "Audio": {
         "gain": "2.0",
@@ -124,7 +157,7 @@ class AudioRecorder:
         else:
             self.rate = min(supported_rates, key=lambda x: abs(x - target_rate))
             logging.warning(f"Устройство не поддерживает {target_rate} Гц, используется {self.rate} Гц")
-        self.channels = min(dev_info["maxInputChannels"], 2)
+        self.channels = 1  # Запись всегда в моно — достаточно для речи, работает с VAD
         self.format = pyaudio.paInt16
         self.chunk = 1024
         self.gain = 2.0
@@ -202,6 +235,7 @@ class WhisperRunner:
         self.config = config
         self.method = config["Recognition"].get("method", "whisper-cli")
         self.server_url = config["Recognition"].get("server_url", "http://127.0.0.1:8080/inference")
+        self.use_vad = config.getboolean("Recognition", "use_vad", fallback=False)
         self.server_process = None
         self.update_paths()
         self._auto_start_server_if_needed()
@@ -221,16 +255,17 @@ class WhisperRunner:
             pass
 
         # Запускаем сервер
-        server_exe = self.config["Paths"].get("server_path", str(BASE_DIR / "whisper-server-vulkan" / "whisper-server.exe"))
+        server_exe = resolve_path(self.config["Paths"].get("server_path", "whisper-vulkan-Server\\whisper-server.exe"))
         if not os.path.exists(server_exe):
             logging.error(f"whisper-server.exe не найден: {server_exe}")
             # Переключаемся на whisper-cli как fallback
             self.method = "whisper-cli"
             return
 
-        model_path = self.config["Paths"]["model"]
+        model_path = resolve_path(self.config["Paths"]["model"])
         device = self.config["Paths"].get("gpu_device_index", "1")
         language = self.config["Recognition"]["language"]
+        vad_model_path = str(RESOURCE_DIR / "models" / "for-tests-silero-v6.2.0-ggml.bin")
 
         cmd = [
             server_exe,
@@ -241,6 +276,10 @@ class WhisperRunner:
             "-t", "6",
             "-l", language,
         ]
+
+        # VAD-флаги для сервера
+        if self.use_vad:
+            cmd += ["--vad", "--vad-model", vad_model_path]
         logging.info(f"Запуск сервера: {' '.join(cmd)}")
 
         try:
@@ -288,17 +327,18 @@ class WhisperRunner:
     def update_paths(self):
         device = self.config["Recognition"]["device"]
         if device == "gpu":
-            self.whisper_exe = self.config["Paths"]["whisper_gpu"]
-            gpu_idx = self.config["Paths"].get("gpu_device_index", "1")
+            self.whisper_exe = resolve_path(self.config["Paths"]["whisper_gpu"])
+            gpu_idx = self.config["Paths"].get("gpu_device_index", "0")
             self.device_flag = ["--device", gpu_idx]
         else:
-            self.whisper_exe = self.config["Paths"]["whisper_cpu"]
-            self.device_flag = ["--device", "0"]
-        self.model_path = self.config["Paths"]["model"]
+            self.whisper_exe = resolve_path(self.config["Paths"]["whisper_cpu"])
+            self.device_flag = []  # CPU-версия не поддерживает --device
+        self.model_path = resolve_path(self.config["Paths"]["model"])
         self.language = self.config["Recognition"]["language"]
         self.method = self.config["Recognition"].get("method", "whisper-cli")
         self.server_url = self.config["Recognition"].get("server_url", "http://127.0.0.1:8080/inference")
-        logging.info(f"Whisper обновлён: method={self.method}, model={self.model_path}, device_flag={self.device_flag}")
+        self.use_vad = self.config.getboolean("Recognition", "use_vad", fallback=False)
+        logging.info(f"Whisper обновлён: method={self.method}, model={self.model_path}, device_flag={self.device_flag}, use_vad={self.use_vad}")
 
         # Если изменился метод, перезапускаем сервер при необходимости
         if self.method == "whisper-server":
@@ -331,6 +371,10 @@ class WhisperRunner:
         if not os.path.exists(self.model_path):
             raise FileNotFoundError(f"Модель не найдена: {self.model_path}")
 
+        # Путь к файлу .txt, который создаст whisper-cli
+        base_name = str(wav_path).rsplit(".", 1)[0]
+        output_txt = base_name + ".txt"
+
         cmd = [
             self.whisper_exe,
             "-m", self.model_path,
@@ -339,6 +383,11 @@ class WhisperRunner:
             "--no-timestamps",
             "-otxt",
         ] + self.device_flag
+
+        # VAD-флаги для whisper-cli
+        if self.use_vad:
+            vad_model_path = str(RESOURCE_DIR / "models" / "for-tests-silero-v6.2.0-ggml.bin")
+            cmd += ["--vad", "--vad-model", vad_model_path]
 
         logging.info(f"Запуск команды: {' '.join(cmd)}")
         try:
@@ -354,10 +403,30 @@ class WhisperRunner:
                 startupinfo=startupinfo,
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
-            text = result.stdout.strip()
-            if not text and result.stderr:
-                text = result.stderr.strip()
-            return text
+            # Логирование stderr для диагностики
+            if result.stderr:
+                logging.warning(f"whisper-cli stderr: {result.stderr.strip()[:500]}")
+            if result.stdout:
+                logging.debug(f"whisper-cli stdout: {result.stdout.strip()[:500]}")
+            
+            # Читаем результат из файла
+            if os.path.exists(output_txt):
+                with open(output_txt, "r", encoding="utf-8") as f:
+                    text = f.read().strip()
+                try:
+                    os.remove(output_txt)
+                    logging.debug(f"Файл .txt удалён: {output_txt}")
+                except Exception as e:
+                    logging.warning(f"Не удалось удалить {output_txt}: {e}")
+                return text
+            else:
+                logging.warning(f"Файл {output_txt} не создан")
+                # Попробовать вернуть текст из stdout как fallback
+                stdout_text = result.stdout.strip() if result.stdout else ""
+                if stdout_text:
+                    logging.info("Текст получен из stdout")
+                    return stdout_text
+                return ""
         except subprocess.TimeoutExpired:
             logging.error("Превышено время ожидания")
             return "[Ошибка: превышено время ожидания]"
@@ -420,7 +489,21 @@ class DictationCore:
         self.recording_thread.join(timeout=2.0)
         self.recording_thread = None
         self.is_recording = False
+        # Очистка оставшихся чанков после вставки всего текста
+        self._cleanup_chunks()
         logging.info("Запись остановлена")
+
+    def _cleanup_chunks(self):
+        """Удаляет все временные чанки из папки (.txt уже удалены в _transcribe_with_cli)."""
+        cleaned = 0
+        for f in CHUNK_DIR.glob("chunk_*.wav"):
+            try:
+                f.unlink()
+                cleaned += 1
+            except Exception as e:
+                logging.warning(f"Не удалось удалить {f}: {e}")
+        if cleaned:
+            logging.info(f"Временные чанки очищены: {cleaned} файлов")
 
     def _process_remaining_buffer(self):
         if not self.full_buffer:
@@ -459,10 +542,12 @@ class DictationCore:
         text = self.runner.transcribe(chunk_path)
         if text and not text.startswith("[Ошибка"):
             self._paste_text(text + " ")
+        # Удаление чанка (.txt уже удалён в _transcribe_with_cli)
         try:
             os.remove(chunk_path)
-        except:
-            pass
+            logging.debug(f"Чанк удалён: {chunk_path}")
+        except Exception as e:
+            logging.warning(f"Не удалось удалить чанк {chunk_path}: {e}")
 
     def _record_and_transcribe(self):
         wav_path = TEMP_WAV
@@ -475,19 +560,36 @@ class DictationCore:
         if os.path.exists(wav_path) and os.path.getsize(wav_path) > 0:
             text = self.runner.transcribe(wav_path)
             self._paste_text(text)
+            # Удаление временного WAV (.txt уже удалён в _transcribe_with_cli)
+            try:
+                os.remove(wav_path)
+                logging.debug(f"Временный WAV удалён: {wav_path}")
+            except Exception as e:
+                logging.warning(f"Не удалось удалить {wav_path}: {e}")
         else:
             logging.warning("Файл пуст или не создан")
             self._paste_text("[Нет записанных данных]")
 
     def _streaming_record(self):
-        chunk_duration = 3.0
-        overlap_duration = 0.5
-        overlap_frames = int(overlap_duration * self.audio.rate / self.audio.chunk)
-        self.full_buffer = []
-        start_time = time.time()
+        """Стриминговая запись с VAD (webrtcvad) — разделение по паузам речи."""
+        vad = webrtcvad.Vad(1)  # агрессивность 0-3, 1 = баланс
+        FRAME_DURATION_MS = 20
+        frame_size = int(self.audio.rate * FRAME_DURATION_MS / 1000) * 2  # 2 байта на сэмпл (int16)
+        # Для частоты 16000: frame_size = 640 байт (320 сэмплов * 2 байта)
+        
+        audio_buffer = bytearray()
+        is_speaking = False
+        silence_counter = 0
+        # Порог тишины: 0.8 сек / 0.020 сек = 40 кадров
+        SILENCE_THRESHOLD = int(0.8 * 1000 / FRAME_DURATION_MS)
+        # Таймер принудительной отправки: 10 сек
+        last_send_time = time.time()
+        FORCE_SEND_INTERVAL = 10.0
+        
+        vad_buffer = bytearray()
         stream = self.audio.p.open(
             format=self.audio.format,
-            channels=self.audio.channels,
+            channels=1,  # webrtcvad требует моно
             rate=self.audio.rate,
             input=True,
             input_device_index=self.audio.device_index,
@@ -497,26 +599,47 @@ class DictationCore:
         try:
             while not self.stop_event.is_set() and self.is_running:
                 data = stream.read(self.audio.chunk, exception_on_overflow=False)
-                self.full_buffer.append(data)
-                elapsed = time.time() - start_time
-                if elapsed >= chunk_duration:
-                    total_frames = len(self.full_buffer)
-                    chunk_frames_count = int(chunk_duration * self.audio.rate / self.audio.chunk)
-                    if total_frames > chunk_frames_count:
-                        chunk_frames = self.full_buffer[-chunk_frames_count:]
+                audio_buffer += data
+                vad_buffer += data
+                
+                # Обработка VAD-кадров
+                while len(vad_buffer) >= frame_size:
+                    frame = bytes(vad_buffer[:frame_size])
+                    vad_buffer = vad_buffer[frame_size:]
+                    
+                    is_speech = vad.is_speech(frame, self.audio.rate)
+                    
+                    if is_speech:
+                        is_speaking = True
+                        silence_counter = 0
                     else:
-                        chunk_frames = self.full_buffer[:]
-                    self._process_chunk(chunk_frames)
-                    if total_frames > overlap_frames:
-                        self.full_buffer = self.full_buffer[-overlap_frames:]
-                    else:
-                        self.full_buffer = []
-                    start_time = time.time()
+                        silence_counter += 1
+                    
+                    # Пауза после речи — отправляем чанк
+                    if silence_counter >= SILENCE_THRESHOLD and is_speaking:
+                        self._process_chunk(audio_buffer)
+                        audio_buffer = bytearray()
+                        is_speaking = False
+                        silence_counter = 0
+                        vad_buffer = bytearray()
+                        last_send_time = time.time()
+                
+                # Принудительная отправка через 10 сек (защита от зависания)
+                if len(audio_buffer) > 0 and (time.time() - last_send_time) >= FORCE_SEND_INTERVAL:
+                    self._process_chunk(audio_buffer)
+                    audio_buffer = bytearray()
+                    is_speaking = False
+                    silence_counter = 0
+                    vad_buffer = bytearray()
+                    last_send_time = time.time()
         except Exception as e:
             logging.error(f"Ошибка в потоковой записи: {e}")
         finally:
             stream.stop_stream()
             stream.close()
+            # Отправка остатка буфера
+            if len(audio_buffer) > 0:
+                self._process_chunk(audio_buffer)
 
     def _paste_text(self, text):
         if not text or text.startswith("[Ошибка]"):
@@ -528,11 +651,17 @@ class DictationCore:
             try:
                 kb.send("ctrl+v")
                 logging.info("Вставка через keyboard.send")
-                return
             except Exception as e:
                 logging.warning(f"keyboard.send не сработал: {e}")
-        pyautogui.hotkey("ctrl", "v", interval=0.1)
-        logging.info("Вставка через pyautogui.hotkey")
+                pyautogui.hotkey("ctrl", "v", interval=0.1)
+                logging.info("Вставка через pyautogui.hotkey")
+        else:
+            pyautogui.hotkey("ctrl", "v", interval=0.1)
+            logging.info("Вставка через pyautogui.hotkey")
+        # Очистка буфера обмена после вставки
+        time.sleep(0.1)
+        pyperclip.copy("")
+        logging.debug("Буфер обмена очищен")
 
     def shutdown(self):
         self.is_running = False
@@ -695,9 +824,12 @@ class SettingsWindow:
         row += 1
 
         ttk.Label(self.tab_engine, text="Индекс GPU (--device):").grid(row=row, column=0, sticky="w", padx=5, pady=2)
-        self.gpu_idx_var = tk.StringVar(value=self.config["Paths"].get("gpu_device_index", "1"))
-        ttk.Entry(self.tab_engine, textvariable=self.gpu_idx_var, width=10).grid(row=row, column=1, sticky="w", padx=5)
-        ttk.Label(self.tab_engine, text="(узнайте через whisper-cli --list-devices)").grid(row=row, column=1, sticky="e", padx=5)
+        gpu_idx_value = self._detect_gpu_index()
+        self.gpu_idx_var = tk.StringVar(value=gpu_idx_value)
+        gpu_combo = ttk.Combobox(self.tab_engine, textvariable=self.gpu_idx_var,
+                                 values=["0", "1"], state="readonly", width=5)
+        gpu_combo.grid(row=row, column=1, sticky="w", padx=5)
+        ttk.Label(self.tab_engine, text="(0=первая GPU)").grid(row=row, column=2, sticky="w", padx=5)
         row += 1
 
         ttk.Label(self.tab_engine, text="Устройство:").grid(row=row, column=0, sticky="w", padx=5, pady=5)
@@ -715,7 +847,7 @@ class SettingsWindow:
         row += 1
 
         ttk.Label(self.tab_engine, text="Путь к whisper-server.exe:").grid(row=row, column=0, sticky="w", padx=5, pady=2)
-        self.server_path_var = tk.StringVar(value=self.config["Paths"].get("server_path", str(BASE_DIR / "whisper-server-vulkan" / "whisper-server.exe")))
+        self.server_path_var = tk.StringVar(value=self.config["Paths"].get("server_path", "whisper-vulkan-Server\\whisper-server.exe"))
         ttk.Entry(self.tab_engine, textvariable=self.server_path_var, width=60).grid(row=row, column=1, padx=5)
         ttk.Button(self.tab_engine, text="Обзор", command=lambda: self._browse_file(self.server_path_var)).grid(row=row, column=2)
         row += 1
@@ -755,9 +887,22 @@ class SettingsWindow:
         ttk.Label(self.tab_audio, text="Микрофон:").grid(row=3, column=0, sticky="w", padx=5, pady=5)
         ttk.Label(self.tab_audio, textvariable=self.mic_info).grid(row=3, column=1, sticky="w", padx=5)
 
-        self.mode_var.trace_add("write", lambda *a: self._save_config())
+        # Чекбокс VAD (Silero)
+        self.vad_var = tk.BooleanVar(value=self.config.getboolean("Recognition", "use_vad", fallback=False))
+        ttk.Checkbutton(self.tab_audio, text="VAD (улучшает качество при паузах)", variable=self.vad_var).grid(row=4, column=1, sticky="w", padx=5, pady=5)
+        ttk.Label(self.tab_audio, text="VAD:").grid(row=4, column=0, sticky="w", padx=5, pady=5)
+
+        self.mode_var.trace_add("write", lambda *a: self._on_mode_change())
         self.sample_rate_var.trace_add("write", lambda *a: self._save_config())
         self.gain_var.trace_add("write", lambda *a: self._save_config())
+        self.vad_var.trace_add("write", lambda *a: self._save_config())
+
+        # Авто-включение VAD при стриминге
+        if self.mode_var.get() == "streaming":
+            self.vad_var.set(True)
+
+        # Привязка изменения метода транскрипции — whisper-server = только GPU
+        self.method_var.trace_add("write", lambda *a: self._on_method_change())
 
     def _get_mic_info(self):
         try:
@@ -810,6 +955,61 @@ class SettingsWindow:
         listener.start()
         top.protocol("WM_DELETE_WINDOW", lambda: (listener.stop(), top.destroy()))
 
+    @staticmethod
+    def _detect_gpu_index():
+        """Определяет индекс GPU через whisper-cli --list-devices."""
+        try:
+            whisper_exe = resolve_path("whisper-vulkan\\whisper-cli.exe")
+            if not os.path.exists(whisper_exe):
+                return "0"
+            result = subprocess.run(
+                [whisper_exe, "--list-devices"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=5
+            )
+            output = result.stdout + result.stderr
+            import re
+            devices = re.findall(r'(\d+)\s*=\s*(.+?)\s*\|\s*uma:\s*(\d+)', output)
+            # uma:0 = дискретная GPU (приоритет), uma:1 = встроенная
+            for idx, name, uma in devices:
+                if uma == "0":
+                    return idx
+            # Если только встроенная — вернём 0
+            return "0"
+        except Exception as e:
+            logging.warning(f"Не удалось определить GPU: {e}")
+            return "0"
+
+    def _on_mode_change(self):
+        """Авто-включение VAD при стриминге."""
+        if self.mode_var.get() == "streaming":
+            self.vad_var.set(True)
+        self._save_config()
+
+    def _on_method_change(self):
+        """При выборе whisper-server — только GPU."""
+        if self.method_var.get() == "whisper-server":
+            self.device_var.set("gpu")
+        self._save_config()
+
+    def _show_temp_notification(self, text):
+        """Показывает временное уведомление, которое исчезает через 0.5 сек."""
+        label = tk.Label(
+            self.root,
+            text=text,
+            bg="#28a745",
+            fg="white",
+            font=("Segoe UI", 9),
+            padx=10,
+            pady=5,
+        )
+        # Центрируем на окне
+        self.root.update_idletasks()
+        x = (self.root.winfo_width() - 200) // 2
+        y = (self.root.winfo_height() - 30) // 2
+        label.place(relx=0.5, rely=0.5, anchor="center")
+        self.root.after(500, label.destroy)
+
     def _browse_file(self, var):
         filename = filedialog.askopenfilename(title="Выберите исполняемый файл")
         if filename:
@@ -828,12 +1028,14 @@ class SettingsWindow:
             self.config["Recognition"]["server_url"] = self.server_url_var.get().strip()
             self.config["Audio"]["gain"] = str(self.gain_var.get())
             self.config["Audio"]["sample_rate"] = self.sample_rate_var.get()
+            self.config["Recognition"]["use_vad"] = str(self.vad_var.get()).lower()
             self.config["Hotkeys"]["hotkey"] = self.hotkey_var.get().strip()
             save_config(self.config)
             self.core.update_settings(self.config)
             self.hotkey_manager.restart_listeners()
             logging.info("Настройки сохранены и применены")
-            messagebox.showinfo("Успех", "Настройки сохранены и применены")
+            # Уведомление с автоскрытием через 0.5 сек
+            self._show_temp_notification("Настройки сохранены и применены")
         except Exception as e:
             logging.error(f"Ошибка сохранения: {e}")
             messagebox.showerror("Ошибка", f"Не удалось сохранить настройки: {e}")
@@ -920,10 +1122,113 @@ class TrayIcon:
         self.icon.run()
 
 # ----------------------------------------------------------------------
+# Очистка старых файлов при старте
+# ----------------------------------------------------------------------
+def _cleanup_old_chunks():
+    """Удаляет временные чанки от предыдущей сессии (только из chunks/)."""
+    cleaned = 0
+    for f in CHUNK_DIR.glob("chunk_*.wav"):
+        try:
+            f.unlink()
+            cleaned += 1
+        except Exception as e:
+            logging.warning(f"Не удалось удалить {f}: {e}")
+    for f in CHUNK_DIR.glob("chunk_*.txt"):
+        try:
+            f.unlink()
+            cleaned += 1
+        except Exception as e:
+            logging.warning(f"Не удалось удалить {f}: {e}")
+    if cleaned:
+        logging.info(f"Очищены старые чанки: {cleaned} файлов")
+
+def clean_old_files():
+    """Полная очистка временных файлов при запуске программы.
+    
+    Удаляет:
+    - Все чанки из chunks/ (chunk_*.wav, chunk_*.txt)
+    - Старые WAV файлы из recordings/ (кроме temp_record.wav)
+    """
+    cleaned = 0
+    
+    # Очистка чанков
+    for f in CHUNK_DIR.glob("chunk_*.wav"):
+        try:
+            f.unlink()
+            cleaned += 1
+        except Exception as e:
+            logging.warning(f"Не удалось удалить {f}: {e}")
+    
+    for f in CHUNK_DIR.glob("chunk_*.txt"):
+        try:
+            f.unlink()
+            cleaned += 1
+        except Exception as e:
+            logging.warning(f"Не удалось удалить {f}: {e}")
+    
+    # Очистка старых WAV записей (кроме temp_record.wav)
+    for f in RECORDINGS_DIR.glob("*.wav"):
+        if f.name != "temp_record.wav":
+            try:
+                f.unlink()
+                cleaned += 1
+            except Exception as e:
+                logging.warning(f"Не удалось удалить {f}: {e}")
+    
+    # Очистка старых TXT файлов в recordings/
+    for f in RECORDINGS_DIR.glob("*.txt"):
+        try:
+            f.unlink()
+            cleaned += 1
+        except Exception as e:
+            logging.warning(f"Не удалось удалить {f}: {e}")
+    
+    if cleaned:
+        logging.info(f"Очистка при старте: удалено {cleaned} файлов из {DATA_DIR}")
+    else:
+        logging.info("Очистка при старте: временных файлов не найдено")
+
+# ----------------------------------------------------------------------
+# Защита от запуска второй копии
+# ----------------------------------------------------------------------
+def _ensure_single_instance():
+    """Проверяет, не запущена ли уже копия программы (через named mutex)."""
+    try:
+        import win32event
+        import win32api
+        MUTEX_NAME = "Global\\WhisperDictation_Mutex"
+        mutex = win32event.CreateMutex(None, False, MUTEX_NAME)
+        if win32api.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            return False
+        return True
+    except ImportError:
+        # Если pywin32 не установлен — пропускаем проверку
+        logging.warning("pywin32 не установлен, проверка единственного экземпляра отключена")
+        return True
+    except Exception as e:
+        logging.warning(f"Ошибка при проверке экземпляра: {e}")
+        return True
+
+# ----------------------------------------------------------------------
 # Главная функция
 # ----------------------------------------------------------------------
 def main():
+    # Проверка: не запущена ли уже копия
+    if not _ensure_single_instance():
+        try:
+            import tkinter as _tk
+            from tkinter import messagebox as _mb
+            _root = _tk.Tk()
+            _root.withdraw()
+            _mb.showinfo("Внимание", "Whisper Dictation уже запущена")
+            _root.destroy()
+        except:
+            pass
+        sys.exit(0)
+    
     logging.info("=== Программа запущена ===")
+    # Полная очистка временных файлов при запуске
+    clean_old_files()
     config = load_config()
     core = DictationCore(config)
     hotkey_manager = HotkeyManager(core, config)
