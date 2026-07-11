@@ -957,24 +957,65 @@ class SettingsWindow:
 
     @staticmethod
     def _detect_gpu_index():
-        """Определяет индекс GPU через whisper-cli --list-devices."""
+        """Определяет индекс GPU через whisper-cli --help (Vulkan инициализация выводит устройства в stderr).
+        
+        Важно: whisper-cli.exe блокируется при capture_output=True (pipe deadlock),
+        поэтому вывод перенаправляется во временный файл.
+        """
         try:
             whisper_exe = resolve_path("whisper-vulkan\\whisper-cli.exe")
             if not os.path.exists(whisper_exe):
+                logging.warning(f"whisper-cli.exe не найден: {whisper_exe}")
                 return "0"
-            result = subprocess.run(
-                [whisper_exe, "--list-devices"],
-                capture_output=True, text=True, encoding="utf-8", errors="replace",
-                timeout=5
-            )
-            output = result.stdout + result.stderr
-            import re
-            devices = re.findall(r'(\d+)\s*=\s*(.+?)\s*\|\s*uma:\s*(\d+)', output)
-            # uma:0 = дискретная GPU (приоритет), uma:1 = встроенная
-            for idx, name, uma in devices:
-                if uma == "0":
-                    return idx
-            # Если только встроенная — вернём 0
+            
+            whisper_dir = os.path.dirname(whisper_exe)
+            
+            # Создаём временный файл для вывода
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w+', suffix='.txt', delete=False, 
+                                             dir=str(DATA_DIR), encoding='utf-8') as tmp:
+                tmp_path = tmp.name
+            
+            try:
+                # Запускаем без capture_output, вывод в файл
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                proc = subprocess.Popen(
+                    [whisper_exe, "--help"],
+                    stdout=open(tmp_path, 'w', encoding='utf-8', errors='replace'),
+                    stderr=subprocess.STDOUT,
+                    cwd=whisper_dir,
+                    startupinfo=startupinfo,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                proc.wait(timeout=10)
+                
+                # Читаем вывод
+                with open(tmp_path, 'r', encoding='utf-8', errors='replace') as f:
+                    output = f.read()
+                
+                logging.info(f"GPU detect: returncode={proc.returncode}, output_len={len(output)}")
+                if len(output) < 500:
+                    logging.debug(f"GPU detect: output = {output}")
+                
+                import re
+                devices = re.findall(r'(\d+)\s*=\s*(.+?)\s*\|\s*uma:\s*(\d+)', output)
+                logging.info(f"GPU detect: найдено устройств = {len(devices)}")
+                # uma:0 = дискретная GPU (приоритет), uma:1 = встроенная
+                for idx, name, uma in devices:
+                    logging.info(f"GPU detect: устройство {idx} = {name}, uma={uma}")
+                    if uma == "0":
+                        return idx
+                # Если только встроенная — вернём 0
+                return "0"
+            finally:
+                # Удаляем временный файл
+                try:
+                    os.remove(tmp_path)
+                except:
+                    pass
+        except subprocess.TimeoutExpired:
+            logging.warning("whisper-cli --help завис, определяем GPU как 0")
             return "0"
         except Exception as e:
             logging.warning(f"Не удалось определить GPU: {e}")
