@@ -16,6 +16,16 @@ import sherpa_onnx
 import pyautogui
 import pyperclip
 import pystray
+
+# ----------------------------------------------------------------------
+# Добавляем путь к ffmpeg в PATH ДО импорта pydub
+# ----------------------------------------------------------------------
+_FFMPEG_DIR = str(Path(__file__).parent / "ffmpeg")
+if os.path.isdir(_FFMPEG_DIR):
+    os.environ["PATH"] += f";{_FFMPEG_DIR}"
+
+import pydub
+from pydub import AudioSegment
 from PIL import Image, ImageDraw
 from pynput import mouse, keyboard
 from pynput.mouse import Button
@@ -101,6 +111,24 @@ def resolve_path(path_str):
     if p.is_absolute():
         return str(p)
     return str(RESOURCE_DIR / p)
+
+# ----------------------------------------------------------------------
+# Инициализация pydub (путь к ffmpeg и ffprobe)
+# ----------------------------------------------------------------------
+FFMPEG_PATH = RESOURCE_DIR / "ffmpeg" / "ffmpeg.exe"
+FFPROBE_PATH = RESOURCE_DIR / "ffmpeg" / "ffprobe.exe"
+if FFMPEG_PATH.exists():
+    pydub.AudioSegment.converter = str(FFMPEG_PATH)
+    pydub.AudioSegment.ffmpeg = str(FFMPEG_PATH)
+    logging.info(f"pydub: ffmpeg найден — {FFMPEG_PATH}")
+else:
+    logging.warning(f"pydub: ffmpeg не найден — {FFMPEG_PATH}. Конвертация аудио не будет работать.")
+
+if FFPROBE_PATH.exists():
+    pydub.AudioSegment.prober = str(FFPROBE_PATH)
+    logging.info(f"pydub: ffprobe найден — {FFPROBE_PATH}")
+else:
+    logging.warning(f"pydub: ffprobe не найден — {FFPROBE_PATH}. Чтение метаданных аудио не будет работать.")
 
 # ----------------------------------------------------------------------
 # Конфигурация (относительные пути)
@@ -1647,17 +1675,73 @@ class SettingsWindow:
             messagebox.showerror("Ошибка", f"Не удалось сохранить настройки: {e}")
 
 # ----------------------------------------------------------------------
+# Конвертация аудио и шумоподавление
+# ----------------------------------------------------------------------
+CONVERTED_TEMP_WAV = RECORDINGS_DIR / "converted_temp.wav"
+
+def convert_to_wav(input_path):
+    """Конвертирует любой аудиофайл в WAV 16kHz mono 16bit через pydub + ffmpeg.
+    
+    Удаляет старый файл converted_temp.wav если существует.
+    Возвращает путь к WAV файлу.
+    """
+    # Удаляем старый файл
+    if CONVERTED_TEMP_WAV.exists():
+        try:
+            CONVERTED_TEMP_WAV.unlink()
+        except Exception as e:
+            logging.warning(f"Не удалось удалить {CONVERTED_TEMP_WAV}: {e}")
+    
+    try:
+        audio = AudioSegment.from_file(input_path)
+        # Конвертация: 16kHz, mono, 16-bit
+        audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
+        audio.export(str(CONVERTED_TEMP_WAV), format="wav")
+        logging.info(f"Конвертация: {input_path} → {CONVERTED_TEMP_WAV} (16kHz, mono, 16bit)")
+        return str(CONVERTED_TEMP_WAV)
+    except Exception as e:
+        logging.error(f"Ошибка конвертации {input_path}: {e}")
+        raise
+
+def apply_noise_reduction(audio, remove_rumble=False, rumble_freq=80, remove_hiss=False, hiss_freq=8000):
+    """Применяет фильтры шумоподавления к аудио через pydub.
+    
+    Args:
+        audio: AudioSegment объект
+        remove_rumble: Убрать низкие частоты (гул, рокот) — high_pass_filter
+        rumble_freq: Частота high_pass фильтра (40-200 Гц, по умолчанию 80)
+        remove_hiss: Убрать высокие частоты (шипение) — low_pass_filter
+        hiss_freq: Частота low_pass фильтра (4000-16000 Гц, по умолчанию 8000)
+    
+    Returns:
+        AudioSegment с применёнными фильтрами
+    """
+    if remove_rumble:
+        audio = audio.high_pass_filter(rumble_freq)
+        logging.info(f"Фильтр: high_pass {rumble_freq} Гц (убран гул)")
+    if remove_hiss:
+        audio = audio.low_pass_filter(hiss_freq)
+        logging.info(f"Фильтр: low_pass {hiss_freq} Гц (убрано шипение)")
+    return audio
+
+# ----------------------------------------------------------------------
 # Окно "Выбрать аудиофайл"
 # ----------------------------------------------------------------------
 class AudioFileWindow:
-    """Окно для распознавания аудиофайлов через Whisper."""
+    """Окно для распознавания аудиофайлов через Whisper.
+    
+    Поддерживает:
+    - Конвертацию любого формата (MP3, FLAC, OGG) → WAV 16kHz mono
+    - Шумоподавление (high_pass / low_pass фильтры)
+    - Прослушивание обработанного файла
+    """
 
     def __init__(self, root, runner, parent_root):
         self.root = root
         self.runner = runner
-        self.parent_root = parent_root  # основной root для _show_toast
+        self.parent_root = parent_root
         self.root.title("Whisper Dictation — Распознавание аудиофайла")
-        self.root.geometry("600x500")
+        self.root.geometry("650x550")
         self.root.resizable(True, True)
 
         # Row 0: панель выбора файла
@@ -1669,21 +1753,73 @@ class AudioFileWindow:
         ttk.Entry(frame_top, textvariable=self.file_path_var, width=40).grid(row=0, column=1, padx=5)
         ttk.Button(frame_top, text="Выбрать файл", command=self._browse_file).grid(row=0, column=2, padx=2)
 
-        # Row 1: кнопка "Распознать" + статус
+        # Row 1: шумоподавление
+        frame_noise = ttk.LabelFrame(root, text="Шумоподавление", padding=5)
+        frame_noise.grid(row=1, column=0, sticky="ew", padx=10, pady=5)
+
+        # Убрать гул (низкие частоты)
+        self.remove_rumble_var = tk.BooleanVar(value=False)
+        chk_rumble = ttk.Checkbutton(frame_noise, text="Убрать гул (низкие частоты)", variable=self.remove_rumble_var)
+        chk_rumble.grid(row=0, column=0, sticky="w", padx=5, pady=2)
+        self._set_tooltip(chk_rumble, "High-pass фильтр — убирает низкие частоты (гул, рокот, шум кондиционера).\n\n"
+                                       "Чем меньше частота — тем больше низких частот останется\n"
+                                       "Чем больше частота — тем больше низких частот будет убрано\n\n"
+                                       "Рекомендуется: 80 Гц")
+        self.rumble_freq_var = tk.IntVar(value=80)
+        scale_rumble = ttk.Scale(frame_noise, from_=40, to=200, variable=self.rumble_freq_var,
+                  orient="horizontal", command=lambda v: self._update_rumble_label())
+        scale_rumble.grid(row=0, column=1, sticky="we", padx=5)
+        self._set_tooltip(scale_rumble, "Частота high-pass фильтра (40-200 Гц).\n\n"
+                                       "40 Гц — только очень низкие частоты\n"
+                                       "80 Гц — рекомендуемое значение\n"
+                                       "200 Гц — убирает много низких частот, голос может стать тонким")
+        self.rumble_label_var = tk.StringVar(value="80 Гц")
+        ttk.Label(frame_noise, textvariable=self.rumble_label_var, foreground="gray",
+                  font=("Segoe UI", 7)).grid(row=0, column=2, sticky="w", padx=2)
+
+        # Убрать шипение (высокие частоты)
+        self.remove_hiss_var = tk.BooleanVar(value=False)
+        chk_hiss = ttk.Checkbutton(frame_noise, text="Убрать шипение (высокие частоты)", variable=self.remove_hiss_var)
+        chk_hiss.grid(row=1, column=0, sticky="w", padx=5, pady=2)
+        self._set_tooltip(chk_hiss, "Low-pass фильтр — убирает высокие частоты (шипение, фон, свист).\n\n"
+                                     "Чем меньше частота — тем больше высоких частот будет убрано\n"
+                                     "Чем больше частота — тем больше высоких частот останется\n\n"
+                                     "Рекомендуется: 8000 Гц")
+        self.hiss_freq_var = tk.IntVar(value=8000)
+        scale_hiss = ttk.Scale(frame_noise, from_=4000, to=16000, variable=self.hiss_freq_var,
+                  orient="horizontal", command=lambda v: self._update_hiss_label())
+        scale_hiss.grid(row=1, column=1, sticky="we", padx=5)
+        self._set_tooltip(scale_hiss, "Частота low-pass фильтра (4000-16000 Гц).\n\n"
+                                       "4000 Гц — убирает много высоких частот, голос может стать глухим\n"
+                                       "8000 Гц — рекомендуемое значение\n"
+                                       "16000 Гц — оставляет почти все высокие частоты")
+        self.hiss_label_var = tk.StringVar(value="8000 Гц")
+        ttk.Label(frame_noise, textvariable=self.hiss_label_var, foreground="gray",
+                  font=("Segoe UI", 7)).grid(row=1, column=2, sticky="w", padx=2)
+
+        frame_noise.grid_columnconfigure(1, weight=1)
+
+        # Row 2: кнопки действий
         frame_btn = ttk.Frame(root, padding=(10, 5))
-        frame_btn.grid(row=1, column=0, sticky="ew")
+        frame_btn.grid(row=2, column=0, sticky="ew")
 
         self.btn_transcribe = ttk.Button(frame_btn, text="Распознать", command=self._transcribe_file)
-        self.btn_transcribe.grid(row=0, column=0, sticky="w")
+        self.btn_transcribe.grid(row=0, column=0, sticky="w", padx=(0, 5))
 
-        # Статус (индикатор состояния, не кнопка)
+        self.btn_play = ttk.Button(frame_btn, text="▶ Прослушать", command=self._play_processed)
+        self.btn_play.grid(row=0, column=1, sticky="w", padx=(0, 5))
+        self._set_tooltip(self.btn_play, "Открывает обработанный WAV файл в плеере Windows.\n\n"
+                                          "Позволяет прослушать результат шумоподавления и оценить качество.\n\n"
+                                          "Файл создаётся при распознавании с включённым шумоподавлением.")
+
+        # Статус
         self.status_var = tk.StringVar(value="Готово")
         ttk.Label(frame_btn, textvariable=self.status_var, foreground="gray",
-                  font=("Segoe UI", 8)).grid(row=0, column=1, sticky="e", padx=(20, 0))
+                  font=("Segoe UI", 8)).grid(row=0, column=2, sticky="e", padx=(20, 0))
 
         # Row 3: текстовое поле + скролл
         frame_text = ttk.Frame(root, padding=(10, 5))
-        frame_text.grid(row=2, column=0, sticky="nsew")
+        frame_text.grid(row=3, column=0, sticky="nsew")
 
         self.text_var = tk.Text(frame_text, wrap="word", state="disabled", font=("Consolas", 10), height=15)
         scrollbar = ttk.Scrollbar(frame_text, orient="vertical", command=self.text_var.yview)
@@ -1693,23 +1829,45 @@ class AudioFileWindow:
 
         # Row 4: кнопки внизу
         frame_bottom = ttk.Frame(root, padding=10)
-        frame_bottom.grid(row=3, column=0, sticky="ew")
+        frame_bottom.grid(row=4, column=0, sticky="ew")
 
         ttk.Button(frame_bottom, text="Скопировать всё", command=self._copy_all).grid(row=0, column=0, padx=5)
         ttk.Button(frame_bottom, text="Очистить", command=self._clear_text).grid(row=0, column=1, padx=5)
 
-        # Настройка весов для растягивания
-        root.grid_rowconfigure(2, weight=1)
+        # Настройка весов
+        root.grid_rowconfigure(3, weight=1)
         root.grid_columnconfigure(0, weight=1)
         frame_text.grid_rowconfigure(0, weight=1)
         frame_text.grid_columnconfigure(0, weight=1)
 
+    def _set_tooltip(self, widget, text):
+        """Добавляет всплывающую подсказку к виджету."""
+        def _on_enter(e):
+            self._tooltip = tk.Toplevel(widget)
+            self._tooltip.wm_overrideredirect(True)
+            self._tooltip.wm_geometry(f"+{e.x_root+10}+{e.y_root+10}")
+            label = tk.Label(self._tooltip, text=text, justify=tk.LEFT,
+                            background="#ffffe0", relief="solid", borderwidth=1,
+                            font=("Segoe UI", 8), wraplength=300)
+            label.pack()
+        def _on_leave(e):
+            if hasattr(self, '_tooltip'):
+                self._tooltip.destroy()
+                del self._tooltip
+        widget.bind("<Enter>", _on_enter)
+        widget.bind("<Leave>", _on_leave)
+
+    def _update_rumble_label(self):
+        self.rumble_label_var.set(f"{self.rumble_freq_var.get()} Гц")
+
+    def _update_hiss_label(self):
+        self.hiss_label_var.set(f"{self.hiss_freq_var.get()} Гц")
+
     def _browse_file(self):
-        """Открывает диалог выбора аудиофайла."""
         filepath = filedialog.askopenfilename(
             title="Выберите аудиофайл",
             filetypes=[
-                ("Аудиофайлы", "*.wav *.mp3 *.flac *.ogg"),
+                ("Аудиофайлы", "*.wav *.mp3 *.flac *.ogg *.m4a *.wma"),
                 ("Все файлы", "*.*"),
             ],
         )
@@ -1717,7 +1875,7 @@ class AudioFileWindow:
             self.file_path_var.set(filepath)
 
     def _transcribe_file(self):
-        """Распознаёт выбранный аудиофайл и добавляет результат в текстовое поле."""
+        """Полный пайплайн: конвертация → фильтры → сохранение → транскрипция."""
         filepath = self.file_path_var.get().strip()
         if not filepath:
             self.status_var.set("Ошибка: не выбран файл")
@@ -1726,16 +1884,49 @@ class AudioFileWindow:
             self.status_var.set(f"Ошибка: файл не найден — {filepath}")
             return
 
-        self.status_var.set("Распознаю...")
+        self.status_var.set("Обработка...")
         self.btn_transcribe.configure(state="disabled")
 
         def _work():
+            wav_path = filepath
             try:
-                text = self.runner.transcribe(filepath)
-                # Добавляем текст в поле
+                # 1. Конвертация (если не WAV)
+                if not filepath.lower().endswith('.wav'):
+                    self.root.after(0, lambda: self.status_var.set("Конвертация..."))
+                    wav_path = convert_to_wav(filepath)
+                
+                # 2. Загрузка аудио для применения фильтров
+                remove_rumble = self.remove_rumble_var.get()
+                remove_hiss = self.remove_hiss_var.get()
+                rumble_freq = self.rumble_freq_var.get()
+                hiss_freq = self.hiss_freq_var.get()
+                
+                if remove_rumble or remove_hiss:
+                    self.root.after(0, lambda: self.status_var.set("Применение фильтров..."))
+                    audio = AudioSegment.from_file(wav_path)
+                    audio = apply_noise_reduction(
+                        audio,
+                        remove_rumble=remove_rumble,
+                        rumble_freq=rumble_freq,
+                        remove_hiss=remove_hiss,
+                        hiss_freq=hiss_freq,
+                    )
+                    # Сохраняем обработанный файл в converted_temp.wav
+                    if CONVERTED_TEMP_WAV.exists():
+                        try:
+                            CONVERTED_TEMP_WAV.unlink()
+                        except:
+                            pass
+                    audio.export(str(CONVERTED_TEMP_WAV), format="wav")
+                    wav_path = str(CONVERTED_TEMP_WAV)
+                    logging.info(f"Фильтры применены, сохранено: {CONVERTED_TEMP_WAV}")
+                
+                # 3. Транскрипция
+                self.root.after(0, lambda: self.status_var.set("Распознаю..."))
+                text = self.runner.transcribe(wav_path)
                 self.root.after(0, lambda: self._append_text(text))
             except Exception as e:
-                logging.error(f"Ошибка распознавания файла {filepath}: {e}")
+                logging.error(f"Ошибка обработки файла {filepath}: {e}")
                 self.root.after(0, lambda: self._append_text(f"[Ошибка: {e}]"))
             finally:
                 self.root.after(0, lambda: (
@@ -1745,8 +1936,19 @@ class AudioFileWindow:
 
         threading.Thread(target=_work, daemon=True).start()
 
+    def _play_processed(self):
+        """Открывает обработанный WAV файл в плеере Windows."""
+        if CONVERTED_TEMP_WAV.exists():
+            try:
+                os.startfile(str(CONVERTED_TEMP_WAV))
+                logging.info(f"Прослушивание: {CONVERTED_TEMP_WAV}")
+            except Exception as e:
+                logging.error(f"Не удалось открыть файл: {e}")
+                messagebox.showerror("Ошибка", f"Не удалось открыть файл: {e}")
+        else:
+            messagebox.showinfo("Инфо", "Сначала распознайте файл с шумоподавлением, чтобы создать обработанный файл")
+
     def _append_text(self, text):
-        """Добавляет текст в текстовое поле с разделителем."""
         self.text_var.configure(state="normal")
         current = self.text_var.get("1.0", "end-1c")
         if current.strip():
@@ -1756,13 +1958,11 @@ class AudioFileWindow:
         self.text_var.configure(state="disabled")
 
     def _copy_all(self):
-        """Копирует весь текст в буфер обмена."""
         text = self.text_var.get("1.0", "end-1c").strip()
         if text:
             pyperclip.copy(text)
 
     def _clear_text(self):
-        """Очищает текстовое поле."""
         self.text_var.configure(state="normal")
         self.text_var.delete("1.0", "end")
         self.text_var.configure(state="disabled")
