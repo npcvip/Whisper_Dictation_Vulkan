@@ -139,7 +139,8 @@ DEFAULT_CONFIG = {
         "whisper_cpu": "whisper-CPU\\whisper-cli.exe",
         "model": "models\\ggml-large-v3-turbo-q8_0.bin",
         "gpu_device_index": "1",
-        "server_path": "whisper-vulkan-Server\\whisper-server.exe",
+        "server_gpu_path": "whisper-vulkan-Server\\whisper-server.exe",
+        "server_cpu_path": "whisper-CPU\\whisper-server.exe",
     },
     "Recognition": {
         "device": "gpu",
@@ -325,6 +326,7 @@ class WhisperRunner:
         self.use_vad = config.getboolean("Recognition", "use_vad", fallback=False)
         self.server_process = None
         self._prev_method = self.method  # для отслеживания смены метода
+        self._prev_device = self.config["Recognition"].get("device", "gpu")  # для отслеживания смены устройства
         self.update_paths()
         self._auto_start_server_if_needed()
 
@@ -348,8 +350,12 @@ class WhisperRunner:
         except:
             pass
 
-        # Запускаем сервер
-        server_exe = resolve_path(self.config["Paths"].get("server_path", "whisper-vulkan-Server\\whisper-server.exe"))
+        # Выбираем сервер в зависимости от устройства
+        device = self.config["Recognition"].get("device", "gpu")
+        if device == "cpu":
+            server_exe = resolve_path(self.config["Paths"].get("server_cpu_path", "whisper-CPU\\whisper-server.exe"))
+        else:
+            server_exe = resolve_path(self.config["Paths"].get("server_gpu_path", "whisper-vulkan-Server\\whisper-server.exe"))
         if not os.path.exists(server_exe):
             logging.error(f"whisper-server.exe не найден: {server_exe}")
             # Переключаемся на whisper-cli как fallback
@@ -477,7 +483,16 @@ class WhisperRunner:
         if self.method == "whisper-server" and old_method != "whisper-server":
             self._auto_start_server_if_needed()
 
+        # Если изменилось устройство и метод = whisper-server — перезапуск сервера
+        new_device = self.config["Recognition"].get("device", "gpu")
+        if self.method == "whisper-server" and new_device != self._prev_device:
+            logging.info(f"Смена устройства: {self._prev_device} → {new_device}, перезапуск сервера")
+            self._stop_server()
+            time.sleep(1)
+            self._auto_start_server_if_needed()
+
         self._prev_method = self.method
+        self._prev_device = new_device
 
     def transcribe(self, wav_path):
         if self.method == "whisper-server" and REQUESTS_AVAILABLE:
@@ -961,24 +976,45 @@ class DictationCore:
         ts = time.strftime("%H:%M:%S")
         logging.info(f"[{ts}] Вставка текста [{mode_label}]: '{preview}...' (длина {len(text)})")
         
-        pyperclip.copy(text)
-        time.sleep(0.15)
-        if KEYBOARD_AVAILABLE:
-            try:
-                kb.send("ctrl+v")
-                logging.info("Вставка через keyboard.send")
-            except Exception as e:
-                logging.warning(f"keyboard.send не сработал: {e}")
+        if streaming:
+            # Стриминг — асинхронные потоки, нужна блокировка буфера обмена
+            with clipboard_lock:
+                pyperclip.copy(text)
+                time.sleep(0.15)
+                if KEYBOARD_AVAILABLE:
+                    try:
+                        kb.send("ctrl+v")
+                        logging.info("Вставка через keyboard.send")
+                    except Exception as e:
+                        logging.warning(f"keyboard.send не сработал: {e}")
+                        pyautogui.hotkey("ctrl", "v", interval=0.1)
+                        logging.info("Вставка через pyautogui.hotkey")
+                else:
+                    pyautogui.hotkey("ctrl", "v", interval=0.1)
+                    logging.info("Вставка через pyautogui.hotkey")
+                # Очистка буфера обмена после вставки
+                time.sleep(0.1)
+                pyperclip.copy("")
+                logging.debug("Буфер обмена очищен")
+        else:
+            # Обычный режим — без блокировки (как раньше)
+            pyperclip.copy(text)
+            time.sleep(0.15)
+            if KEYBOARD_AVAILABLE:
+                try:
+                    kb.send("ctrl+v")
+                    logging.info("Вставка через keyboard.send")
+                except Exception as e:
+                    logging.warning(f"keyboard.send не сработал: {e}")
+                    pyautogui.hotkey("ctrl", "v", interval=0.1)
+                    logging.info("Вставка через pyautogui.hotkey")
+            else:
                 pyautogui.hotkey("ctrl", "v", interval=0.1)
                 logging.info("Вставка через pyautogui.hotkey")
-        else:
-            pyautogui.hotkey("ctrl", "v", interval=0.1)
-            logging.info("Вставка через pyautogui.hotkey")
-        
-        # Очистка буфера обмена после вставки
-        time.sleep(0.1)
-        pyperclip.copy("")
-        logging.debug("Буфер обмена очищен")
+            # Очистка буфера обмена после вставки
+            time.sleep(0.1)
+            pyperclip.copy("")
+            logging.debug("Буфер обмена очищен")
 
     def shutdown(self):
         self.is_running = False
@@ -1196,12 +1232,20 @@ class SettingsWindow:
         method_combo.grid(row=row, column=1, sticky="w", padx=5)
         row += 1
 
-        lbl = ttk.Label(self.tab_engine, text="Путь к whisper-server.exe:")
+        lbl = ttk.Label(self.tab_engine, text="Путь к whisper-server (GPU):")
         lbl.grid(row=row, column=0, sticky="w", padx=5, pady=2)
-        self._set_tooltip(lbl, "Путь к исполняемому файлу whisper-server (локальный HTTP-сервер)")
-        self.server_path_var = tk.StringVar(value=self.config["Paths"].get("server_path", "whisper-vulkan-Server\\whisper-server.exe"))
-        ttk.Entry(self.tab_engine, textvariable=self.server_path_var, width=60).grid(row=row, column=1, padx=5)
-        ttk.Button(self.tab_engine, text="Обзор", command=lambda: self._browse_file(self.server_path_var)).grid(row=row, column=2)
+        self._set_tooltip(lbl, "Путь к исполняемому файлу whisper-server для GPU (Vulkan). Используется при выборе устройства GPU + метода транскрипции whisper-server. Модель загружается в видеопамять GPU")
+        self.server_gpu_path_var = tk.StringVar(value=self.config["Paths"].get("server_gpu_path", "whisper-vulkan-Server\\whisper-server.exe"))
+        ttk.Entry(self.tab_engine, textvariable=self.server_gpu_path_var, width=60).grid(row=row, column=1, padx=5)
+        ttk.Button(self.tab_engine, text="Обзор", command=lambda: self._browse_file(self.server_gpu_path_var)).grid(row=row, column=2)
+        row += 1
+
+        lbl = ttk.Label(self.tab_engine, text="Путь к whisper-server (CPU):")
+        lbl.grid(row=row, column=0, sticky="w", padx=5, pady=2)
+        self._set_tooltip(lbl, "Путь к исполняемому файлу whisper-server для CPU. Используется при выборе устройства CPU + метода транскрипции whisper-server. Модель загружается в оперативную память")
+        self.server_cpu_path_var = tk.StringVar(value=self.config["Paths"].get("server_cpu_path", "whisper-CPU\\whisper-server.exe"))
+        ttk.Entry(self.tab_engine, textvariable=self.server_cpu_path_var, width=60).grid(row=row, column=1, padx=5)
+        ttk.Button(self.tab_engine, text="Обзор", command=lambda: self._browse_file(self.server_cpu_path_var)).grid(row=row, column=2)
         row += 1
 
         lbl = ttk.Label(self.tab_engine, text="URL сервера:")
@@ -1210,7 +1254,7 @@ class SettingsWindow:
         self.server_url_var = tk.StringVar(value=self.config["Recognition"].get("server_url", "http://127.0.0.1:18877/inference"))
         ttk.Entry(self.tab_engine, textvariable=self.server_url_var, width=50).grid(row=row, column=1, sticky="w", padx=5)
 
-        for var in (self.gpu_path_var, self.cpu_path_var, self.model_path_var, self.gpu_idx_var, self.server_path_var):
+        for var in (self.gpu_path_var, self.cpu_path_var, self.model_path_var, self.gpu_idx_var, self.server_gpu_path_var, self.server_cpu_path_var):
             var.trace_add("write", lambda *a: self._save_config())
         self.device_var.trace_add("write", lambda *a: self._save_config())
         self.method_var.trace_add("write", lambda *a: self._save_config())
@@ -1601,9 +1645,10 @@ class SettingsWindow:
         self.vad_chunk_duration_var.set(round(float(value), 2))
 
     def _on_method_change(self):
-        """При выборе whisper-server — только GPU."""
-        if self.method_var.get() == "whisper-server":
-            self.device_var.set("gpu")
+        """При смене метода транскрипции — сохранить конфиг.
+        
+        whisper-server теперь работает и на GPU, и на CPU — авто-переключение удалено.
+        """
         self._save_config()
 
     def _show_temp_notification(self, text):
@@ -1638,7 +1683,8 @@ class SettingsWindow:
                 ("Paths", "whisper_cpu", self.cpu_path_var),
                 ("Paths", "model", self.model_path_var),
                 ("Paths", "gpu_device_index", lambda: self.gpu_idx_var.get().strip() or "1"),
-                ("Paths", "server_path", lambda: self.server_path_var.get().strip()),
+                ("Paths", "server_gpu_path", lambda: self.server_gpu_path_var.get().strip()),
+                ("Paths", "server_cpu_path", lambda: self.server_cpu_path_var.get().strip()),
                 ("Recognition", "device", self.device_var),
                 ("Recognition", "mode", self.mode_var),
                 ("Recognition", "method", self.method_var),
@@ -1673,6 +1719,11 @@ class SettingsWindow:
         except Exception as e:
             logging.error(f"Ошибка сохранения: {e}")
             messagebox.showerror("Ошибка", f"Не удалось сохранить настройки: {e}")
+
+# ----------------------------------------------------------------------
+# Блокировка буфера обмена для стриминга (асинхронные потоки)
+# ----------------------------------------------------------------------
+clipboard_lock = threading.Lock()
 
 # ----------------------------------------------------------------------
 # Конвертация аудио и шумоподавление
