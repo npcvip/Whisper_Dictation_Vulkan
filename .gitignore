@@ -9,6 +9,8 @@ GITHUB_TOKEN.env
 *.env
 .env.*
 
+ggml*.bin
+
 # Кэш и зависимости Python
 __pycache__/
 *.py[cod]

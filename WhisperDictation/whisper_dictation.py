@@ -327,6 +327,7 @@ class WhisperRunner:
         self.server_process = None
         self._prev_method = self.method  # для отслеживания смены метода
         self._prev_device = self.config["Recognition"].get("device", "gpu")  # для отслеживания смены устройства
+        self._prev_model = resolve_path(self.config["Paths"]["model"])  # для отслеживания смены модели
         self.update_paths()
         self._auto_start_server_if_needed()
 
@@ -491,8 +492,16 @@ class WhisperRunner:
             time.sleep(1)
             self._auto_start_server_if_needed()
 
+        # Если изменилась модель и метод = whisper-server — перезапуск сервера
+        if self.method == "whisper-server" and self.model_path != self._prev_model:
+            logging.info(f"Смена модели: {self._prev_model} → {self.model_path}, перезапуск сервера")
+            self._stop_server()
+            time.sleep(1)
+            self._auto_start_server_if_needed()
+
         self._prev_method = self.method
         self._prev_device = new_device
+        self._prev_model = self.model_path
 
     def transcribe(self, wav_path):
         if self.method == "whisper-server" and REQUESTS_AVAILABLE:
@@ -1940,6 +1949,7 @@ class AudioFileWindow:
 
         def _work():
             wav_path = filepath
+            start_time = time.time()
             try:
                 # 1. Конвертация (если не WAV)
                 if not filepath.lower().endswith('.wav'):
@@ -1975,7 +1985,8 @@ class AudioFileWindow:
                 # 3. Транскрипция
                 self.root.after(0, lambda: self.status_var.set("Распознаю..."))
                 text = self.runner.transcribe(wav_path)
-                self.root.after(0, lambda: self._append_text(text))
+                elapsed = time.time() - start_time
+                self.root.after(0, lambda: self._append_text(text, elapsed=elapsed))
             except Exception as e:
                 logging.error(f"Ошибка обработки файла {filepath}: {e}")
                 self.root.after(0, lambda: self._append_text(f"[Ошибка: {e}]"))
@@ -1999,12 +2010,21 @@ class AudioFileWindow:
         else:
             messagebox.showinfo("Инфо", "Сначала распознайте файл с шумоподавлением, чтобы создать обработанный файл")
 
-    def _append_text(self, text):
+    def _append_text(self, text, elapsed=None):
         self.text_var.configure(state="normal")
         current = self.text_var.get("1.0", "end-1c")
         if current.strip():
             self.text_var.insert("end", "\n---\n")
         self.text_var.insert("end", text.strip())
+        # Добавляем время обработки
+        if elapsed is not None:
+            minutes = int(elapsed) // 60
+            seconds = int(elapsed) % 60
+            if minutes > 0:
+                time_str = f"{minutes} мин {seconds} сек"
+            else:
+                time_str = f"{seconds} сек"
+            self.text_var.insert("end", f"\n\n---\nВремя обработки: {time_str}")
         self.text_var.see("end")
         self.text_var.configure(state="disabled")
 
