@@ -11,7 +11,8 @@ from pathlib import Path
 import logging
 
 import pyaudio
-import webrtcvad
+import numpy as np
+import sherpa_onnx
 import pyautogui
 import pyperclip
 import pystray
@@ -73,6 +74,15 @@ RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 CHUNK_DIR.mkdir(parents=True, exist_ok=True)
 
 # ----------------------------------------------------------------------
+# Очистка логов при запуске
+# ----------------------------------------------------------------------
+if LOG_PATH.exists():
+    try:
+        LOG_PATH.unlink()
+    except Exception:
+        pass
+
+# ----------------------------------------------------------------------
 # Логирование (ПОСЛЕ создания папок)
 # ----------------------------------------------------------------------
 logging.basicConfig(
@@ -108,8 +118,13 @@ DEFAULT_CONFIG = {
         "mode": "record_then_analyze",
         "language": "ru",
         "method": "whisper-server",   # "whisper-cli" или "whisper-server"
-        "server_url": "http://127.0.0.1:8080/inference",
+        "server_url": "http://127.0.0.1:18877/inference",
         "use_vad": "false",
+        "use_vad_streaming": "true",
+        "vad_threshold": "0.5",
+        "vad_min_silence_duration": "0.7",
+        "vad_min_speech_duration": "0.25",
+        "min_chunk_duration": "3.0",
     },
     "Audio": {
         "gain": "2.0",
@@ -148,19 +163,29 @@ class AudioRecorder:
     def __init__(self, config):
         self.config = config
         self.p = pyaudio.PyAudio()
-        self.device_index = self.p.get_default_input_device_info()["index"]
-        dev_info = self.p.get_device_info_by_index(self.device_index)
-        target_rate = int(config["Audio"].get("sample_rate", "16000"))
-        supported_rates = self._get_supported_sample_rates(dev_info)
-        if target_rate in supported_rates:
-            self.rate = target_rate
-        else:
-            self.rate = min(supported_rates, key=lambda x: abs(x - target_rate))
-            logging.warning(f"Устройство не поддерживает {target_rate} Гц, используется {self.rate} Гц")
-        self.channels = 1  # Запись всегда в моно — достаточно для речи, работает с VAD
+        self.mic_available = True
+        self.device_index = None
+        self.rate = 16000
+        self.channels = 1
         self.format = pyaudio.paInt16
         self.chunk = 1024
         self.gain = 2.0
+
+        # Попытка получить микрофон
+        try:
+            dev_info = self.p.get_default_input_device_info()
+            self.device_index = dev_info["index"]
+            target_rate = int(config["Audio"].get("sample_rate", "16000"))
+            supported_rates = self._get_supported_sample_rates(dev_info)
+            if target_rate in supported_rates:
+                self.rate = target_rate
+            else:
+                self.rate = min(supported_rates, key=lambda x: abs(x - target_rate))
+                logging.warning(f"Устройство не поддерживает {target_rate} Гц, используется {self.rate} Гц")
+            logging.info(f"Микрофон найден: {dev_info['name']} (индекс {self.device_index})")
+        except Exception as e:
+            self.mic_available = False
+            logging.warning(f"Микрофон не найден: {e}")
 
     def _get_supported_sample_rates(self, dev_info):
         common_rates = [8000, 11025, 16000, 22050, 32000, 44100, 48000]
@@ -228,15 +253,50 @@ class AudioRecorder:
         self.p.terminate()
 
 # ----------------------------------------------------------------------
+# Ten VAD через sherpa-onnx
+# ----------------------------------------------------------------------
+class TenVAD:
+    """Ten VAD через sherpa-onnx — потоковая детекция речи."""
+    
+    def __init__(self, model_path, threshold=0.5, sample_rate=16000,
+                 min_silence_duration=0.7, min_speech_duration=0.25):
+        vad_config = sherpa_onnx.TenVadModelConfig(
+            model=model_path,
+            threshold=threshold,
+            min_silence_duration=min_silence_duration,
+            min_speech_duration=min_speech_duration,
+        )
+        config = sherpa_onnx.VadModelConfig()
+        config.ten_vad = vad_config
+        config.sample_rate = sample_rate
+        config.num_threads = 1
+        self.vad = sherpa_onnx.VoiceActivityDetector(config)
+        self.sample_rate = sample_rate
+    
+    def reset(self):
+        """Сброс состояния VAD."""
+        self.vad.reset()
+    
+    def accept_waveform(self, samples):
+        """Подача сэмплов в VAD (list of float или numpy array)."""
+        self.vad.accept_waveform(samples.tolist() if isinstance(samples, np.ndarray) else samples)
+    
+    def is_speech_detected(self):
+        """Возвращает True если речь обнаружена."""
+        return self.vad.is_speech_detected()
+
+
+# ----------------------------------------------------------------------
 # Whisper Runner (поддерживает whisper-cli и whisper-server с автозапуском)
 # ----------------------------------------------------------------------
 class WhisperRunner:
     def __init__(self, config):
         self.config = config
         self.method = config["Recognition"].get("method", "whisper-cli")
-        self.server_url = config["Recognition"].get("server_url", "http://127.0.0.1:8080/inference")
+        self.server_url = config["Recognition"].get("server_url", "http://127.0.0.1:18877/inference")
         self.use_vad = config.getboolean("Recognition", "use_vad", fallback=False)
         self.server_process = None
+        self._prev_method = self.method  # для отслеживания смены метода
         self.update_paths()
         self._auto_start_server_if_needed()
 
@@ -247,10 +307,16 @@ class WhisperRunner:
 
         # Проверяем, не запущен ли уже сервер
         try:
-            r = requests.get("http://127.0.0.1:8080/health", timeout=1)
+            r = requests.get("http://127.0.0.1:18877/health", timeout=1)
             if r.status_code == 200:
-                logging.info("Сервер уже запущен, подключаемся")
-                return
+                # Если это наш процесс — всё ок
+                if self.server_process and self.server_process.poll() is None:
+                    logging.info("Сервер уже запущен (наш процесс), подключаемся")
+                    return
+                # Если это чужой процесс (от предыдущей сессии) — убиваем и запускаем свой
+                logging.warning("Обнаружен чужой сервер на порту 18877, завершаем и запускаем новый")
+                self._kill_server_by_port(18877)
+                time.sleep(1)
         except:
             pass
 
@@ -265,14 +331,14 @@ class WhisperRunner:
         model_path = resolve_path(self.config["Paths"]["model"])
         device = self.config["Paths"].get("gpu_device_index", "1")
         language = self.config["Recognition"]["language"]
-        vad_model_path = str(RESOURCE_DIR / "models" / "for-tests-silero-v6.2.0-ggml.bin")
+        vad_model_path = str(RESOURCE_DIR / "models" / "ggml-silero-v6.2.0.bin")
 
         cmd = [
             server_exe,
             "-m", model_path,
             "--device", device,
             "--host", "127.0.0.1",
-            "--port", "8080",
+            "--port", "18877",
             "-t", "6",
             "-l", language,
         ]
@@ -303,7 +369,7 @@ class WhisperRunner:
         for i in range(30):  # максимум 30 попыток (~30 секунд)
             time.sleep(1)
             try:
-                r = requests.get("http://127.0.0.1:8080/health", timeout=1)
+                r = requests.get("http://127.0.0.1:18877/health", timeout=1)
                 if r.status_code == 200:
                     logging.info("Сервер готов к работе")
                     return
@@ -316,13 +382,46 @@ class WhisperRunner:
         self.method = "whisper-cli"
         self._stop_server()
 
+    def _kill_server_by_port(self, port=18877):
+        """Убивает процесс, занимающий указанный порт (Windows)."""
+        try:
+            result = subprocess.run(
+                ["netstat", "-ano"], capture_output=True, text=True, timeout=5
+            )
+            for line in result.stdout.splitlines():
+                if f":{port}" in line and "LISTENING" in line:
+                    pid = line.strip().split()[-1]
+                    subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True, timeout=5)
+                    logging.info(f"Убит процесс PID={pid} на порту {port}")
+                    return True
+            logging.info(f"Нет процессов на порту {port}")
+            return False
+        except Exception as e:
+            logging.warning(f"Не удалось убить сервер на порту {port}: {e}")
+            return False
+
     def _stop_server(self):
         """Завершает процесс сервера."""
         if self.server_process and self.server_process.poll() is None:
+            # Наш процесс — завершаем его
             self.server_process.terminate()
-            self.server_process.wait(timeout=3)
-            logging.info("Сервер остановлен")
+            try:
+                self.server_process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self.server_process.kill()
             self.server_process = None
+            logging.info("Сервер остановлен (собственный процесс)")
+        elif REQUESTS_AVAILABLE:
+            # Сервер не наш (от предыдущей сессии) — проверяем и убиваем по порту
+            try:
+                r = requests.get("http://127.0.0.1:18877/health", timeout=1)
+                if r.status_code == 200:
+                    logging.warning("Сервер не наш процесс, убиваем по порту 18877")
+                    self._kill_server_by_port(18877)
+                    time.sleep(0.5)
+            except Exception as e:
+                logging.warning(f"Сервер недоступен при остановке: {e}")
+        self.server_process = None
 
     def update_paths(self):
         device = self.config["Recognition"]["device"]
@@ -335,17 +434,34 @@ class WhisperRunner:
             self.device_flag = []  # CPU-версия не поддерживает --device
         self.model_path = resolve_path(self.config["Paths"]["model"])
         self.language = self.config["Recognition"]["language"]
+        old_method = self.method
         self.method = self.config["Recognition"].get("method", "whisper-cli")
-        self.server_url = self.config["Recognition"].get("server_url", "http://127.0.0.1:8080/inference")
+        self.server_url = self.config["Recognition"].get("server_url", "http://127.0.0.1:18877/inference")
         self.use_vad = self.config.getboolean("Recognition", "use_vad", fallback=False)
         logging.info(f"Whisper обновлён: method={self.method}, model={self.model_path}, device_flag={self.device_flag}, use_vad={self.use_vad}")
 
+        # Если переключились с whisper-server на whisper-cli — останавливаем сервер
+        if old_method == "whisper-server" and self.method != "whisper-server":
+            logging.info("Переключение с whisper-server на whisper-cli, остановка сервера")
+            self._stop_server()
+
         # Если изменился метод, перезапускаем сервер при необходимости
-        if self.method == "whisper-server":
+        if self.method == "whisper-server" and old_method != "whisper-server":
             self._auto_start_server_if_needed()
+
+        self._prev_method = self.method
 
     def transcribe(self, wav_path):
         if self.method == "whisper-server" and REQUESTS_AVAILABLE:
+            # Быстрая проверка: сервер отвечает на /inference?
+            try:
+                r = requests.get("http://127.0.0.1:18877/health", timeout=3)
+                if r.status_code != 200:
+                    raise ConnectionError("Сервер не отвечает")
+            except Exception as e:
+                logging.warning(f"Сервер недоступен перед транскрипцией: {e}, переключение на cli")
+                return self._transcribe_with_cli(wav_path)
+
             try:
                 with open(wav_path, 'rb') as f:
                     files = {'file': (os.path.basename(wav_path), f, 'audio/wav')}
@@ -371,9 +487,21 @@ class WhisperRunner:
         if not os.path.exists(self.model_path):
             raise FileNotFoundError(f"Модель не найдена: {self.model_path}")
 
-        # Путь к файлу .txt, который создаст whisper-cli
-        base_name = str(wav_path).rsplit(".", 1)[0]
-        output_txt = base_name + ".txt"
+        # whisper-cli с -otxt создаёт файл <output>.txt
+        # -of принимает имя БЕЗ расширения (см. --help: "output file path (without file extension)")
+        wav_basename = os.path.basename(str(wav_path)).rsplit(".", 1)[0]
+        output_base = str(RECORDINGS_DIR / wav_basename)  # путь без расширения (для -of)
+        output_txt = output_base + ".txt"                 # полный путь к .txt файлу
+
+        # VAD-логирование
+        wav_size = os.path.getsize(str(wav_path))
+        # Примерная длительность: 16000 Гц * 2 байта * 1 канал = 32000 байт/сек
+        wav_duration = wav_size / 32000.0
+        if self.use_vad:
+            vad_model_path = str(RESOURCE_DIR / "models" / "ggml-silero-v6.2.0.bin")
+            logging.info(f"VAD [whisper-cli]: включён, модель={vad_model_path}, аудио={wav_size} байт (~{wav_duration:.1f} сек)")
+        else:
+            logging.info(f"VAD [whisper-cli]: выключен, аудио={wav_size} байт (~{wav_duration:.1f} сек)")
 
         cmd = [
             self.whisper_exe,
@@ -382,11 +510,11 @@ class WhisperRunner:
             "-l", self.language,
             "--no-timestamps",
             "-otxt",
+            "-of", output_base,  # путь БЕЗ расширения — whisper-cli добавит .txt
         ] + self.device_flag
 
         # VAD-флаги для whisper-cli
         if self.use_vad:
-            vad_model_path = str(RESOURCE_DIR / "models" / "for-tests-silero-v6.2.0-ggml.bin")
             cmd += ["--vad", "--vad-model", vad_model_path]
 
         logging.info(f"Запуск команды: {' '.join(cmd)}")
@@ -402,6 +530,7 @@ class WhisperRunner:
                 timeout=120,
                 startupinfo=startupinfo,
                 creationflags=subprocess.CREATE_NO_WINDOW,
+                cwd=str(RECORDINGS_DIR),  # .txt создастся в RECORDINGS_DIR
             )
             # Логирование stderr для диагностики
             if result.stderr:
@@ -409,19 +538,17 @@ class WhisperRunner:
             if result.stdout:
                 logging.debug(f"whisper-cli stdout: {result.stdout.strip()[:500]}")
             
-            # Читаем результат из файла
+            # Читаем результат из .txt файла (основной способ)
             if os.path.exists(output_txt):
                 with open(output_txt, "r", encoding="utf-8") as f:
                     text = f.read().strip()
-                try:
-                    os.remove(output_txt)
-                    logging.debug(f"Файл .txt удалён: {output_txt}")
-                except Exception as e:
-                    logging.warning(f"Не удалось удалить {output_txt}: {e}")
+                # TXT НЕ удаляется — оставляем для отладки (удалится при следующей записи)
+                logging.debug(f"Файл .txt сохранён для отладки: {output_txt}")
+                logging.info(f"Текст получен из файла: {len(text)} символов")
                 return text
             else:
-                logging.warning(f"Файл {output_txt} не создан")
-                # Попробовать вернуть текст из stdout как fallback
+                logging.warning(f"Файл {output_txt} не создан, fallback на stdout")
+                # Fallback: текст из stdout (работает только в режиме разработки)
                 stdout_text = result.stdout.strip() if result.stdout else ""
                 if stdout_text:
                     logging.info("Текст получен из stdout")
@@ -452,6 +579,18 @@ class DictationCore:
         self.full_buffer = []
         self.is_recording = False
         self.is_running = True
+        
+        # Предзагрузка модели Ten VAD (sherpa-onnx)
+        self._vad = None
+        try:
+            model_path = str(RESOURCE_DIR / "models" / "ten-vad.onnx")
+            if os.path.exists(model_path):
+                self._vad = TenVAD(model_path, sample_rate=16000)
+                logging.info(f"Ten VAD (sherpa-onnx) загружен: {model_path}")
+            else:
+                logging.warning(f"Ten VAD модель не найдена: {model_path}")
+        except Exception as e:
+            logging.warning(f"Ten VAD не загружен: {e}")
 
     def update_settings(self, config):
         self.config = config
@@ -465,6 +604,14 @@ class DictationCore:
             return
         if self.recording_thread and self.recording_thread.is_alive():
             return
+        # Проверка микрофона перед записью
+        if not self.audio.mic_available:
+            logging.warning("Запись не начата: микрофон не найден")
+            return
+        # Очистка старых чанков перед началом записи
+        self._cleanup_chunks()
+        # Логирование реальной частоты микрофона
+        logging.info(f"Частота записи: {self.audio.rate} Гц (устройство: {self.audio.device_index})")
         self.stop_event.clear()
         if self.mode == "record_then_analyze":
             self.recording_thread = threading.Thread(
@@ -489,21 +636,33 @@ class DictationCore:
         self.recording_thread.join(timeout=2.0)
         self.recording_thread = None
         self.is_recording = False
-        # Очистка оставшихся чанков после вставки всего текста
-        self._cleanup_chunks()
         logging.info("Запись остановлена")
 
     def _cleanup_chunks(self):
-        """Удаляет все временные чанки из папки (.txt уже удалены в _transcribe_with_cli)."""
+        """Удаляет все временные файлы из папок chunks/ и recordings/ (.wav + .txt)."""
         cleaned = 0
+        # Чанки из chunks/
         for f in CHUNK_DIR.glob("chunk_*.wav"):
             try:
                 f.unlink()
                 cleaned += 1
             except Exception as e:
                 logging.warning(f"Не удалось удалить {f}: {e}")
+        for f in CHUNK_DIR.glob("chunk_*.txt"):
+            try:
+                f.unlink()
+                cleaned += 1
+            except Exception as e:
+                logging.warning(f"Не удалось удалить {f}: {e}")
+        # TXT из recordings/ (остатки от транскрипции)
+        for f in RECORDINGS_DIR.glob("*.txt"):
+            try:
+                f.unlink()
+                cleaned += 1
+            except Exception as e:
+                logging.warning(f"Не удалось удалить {f}: {e}")
         if cleaned:
-            logging.info(f"Временные чанки очищены: {cleaned} файлов")
+            logging.info(f"Временные файлы очищены: {cleaned} файлов")
 
     def _process_remaining_buffer(self):
         if not self.full_buffer:
@@ -514,6 +673,12 @@ class DictationCore:
 
     def _process_chunk(self, frames):
         if not frames:
+            return
+        # Фильтр: пропускаем слишком короткие чанки (< 300ms)
+        total_bytes = sum(len(f) for f in frames)
+        duration = total_bytes / 32000.0
+        if duration < 0.3:
+            logging.debug(f"Чанк слишком короткий ({duration:.1f} сек, {total_bytes} байт), пропускаем")
             return
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         chunk_path = CHUNK_DIR / f"chunk_{timestamp}.wav"
@@ -541,13 +706,9 @@ class DictationCore:
 
         text = self.runner.transcribe(chunk_path)
         if text and not text.startswith("[Ошибка"):
-            self._paste_text(text + " ")
-        # Удаление чанка (.txt уже удалён в _transcribe_with_cli)
-        try:
-            os.remove(chunk_path)
-            logging.debug(f"Чанк удалён: {chunk_path}")
-        except Exception as e:
-            logging.warning(f"Не удалось удалить чанк {chunk_path}: {e}")
+            self._paste_text(text + " ", streaming=True)
+        # Чанк НЕ удаляется — оставляем для отладки (удалится при следующей записи)
+        logging.info(f"Чанк сохранён для отладки: {chunk_path}")
 
     def _record_and_transcribe(self):
         wav_path = TEMP_WAV
@@ -559,92 +720,219 @@ class DictationCore:
             return
         if os.path.exists(wav_path) and os.path.getsize(wav_path) > 0:
             text = self.runner.transcribe(wav_path)
-            self._paste_text(text)
-            # Удаление временного WAV (.txt уже удалён в _transcribe_with_cli)
-            try:
-                os.remove(wav_path)
-                logging.debug(f"Временный WAV удалён: {wav_path}")
-            except Exception as e:
-                logging.warning(f"Не удалось удалить {wav_path}: {e}")
+            self._paste_text(text + " ", streaming=False)
+            # WAV НЕ удаляется — оставляем для отладки (удалится при следующей записи)
+            logging.info(f"WAV сохранён для отладки: {wav_path}")
         else:
             logging.warning("Файл пуст или не создан")
             self._paste_text("[Нет записанных данных]")
 
-    def _streaming_record(self):
-        """Стриминговая запись с VAD (webrtcvad) — разделение по паузам речи."""
-        vad = webrtcvad.Vad(1)  # агрессивность 0-3, 1 = баланс
-        FRAME_DURATION_MS = 20
-        frame_size = int(self.audio.rate * FRAME_DURATION_MS / 1000) * 2  # 2 байта на сэмпл (int16)
-        # Для частоты 16000: frame_size = 640 байт (320 сэмплов * 2 байта)
-        
+    def _streaming_record_no_vad(self):
+        """Стриминговая запись БЕЗ VAD — весь буфер → один чанк при остановке."""
         audio_buffer = bytearray()
-        is_speaking = False
-        silence_counter = 0
-        # Порог тишины: 0.8 сек / 0.020 сек = 40 кадров
-        SILENCE_THRESHOLD = int(0.8 * 1000 / FRAME_DURATION_MS)
-        # Таймер принудительной отправки: 10 сек
-        last_send_time = time.time()
-        FORCE_SEND_INTERVAL = 10.0
-        
-        vad_buffer = bytearray()
         stream = self.audio.p.open(
             format=self.audio.format,
-            channels=1,  # webrtcvad требует моно
+            channels=1,
             rate=self.audio.rate,
             input=True,
             input_device_index=self.audio.device_index,
             frames_per_buffer=self.audio.chunk,
         )
-
+        
+        logging.info(f"VAD [streaming NO VAD]: запись без VAD, частота: {self.audio.rate} Гц")
+        
         try:
             while not self.stop_event.is_set() and self.is_running:
                 data = stream.read(self.audio.chunk, exception_on_overflow=False)
+                # Применяем gain (как в record_to_file)
+                if self.audio.gain != 1.0:
+                    samples = struct.unpack(f"<{len(data)//2}h", data)
+                    amplified = []
+                    for s in samples:
+                        ns = int(s * self.audio.gain)
+                        if ns > 32767:
+                            ns = 32767
+                        elif ns < -32768:
+                            ns = -32768
+                        amplified.append(ns)
+                    data = struct.pack(f"<{len(amplified)}h", *amplified)
                 audio_buffer += data
-                vad_buffer += data
-                
-                # Обработка VAD-кадров
-                while len(vad_buffer) >= frame_size:
-                    frame = bytes(vad_buffer[:frame_size])
-                    vad_buffer = vad_buffer[frame_size:]
-                    
-                    is_speech = vad.is_speech(frame, self.audio.rate)
-                    
-                    if is_speech:
-                        is_speaking = True
-                        silence_counter = 0
-                    else:
-                        silence_counter += 1
-                    
-                    # Пауза после речи — отправляем чанк
-                    if silence_counter >= SILENCE_THRESHOLD and is_speaking:
-                        self._process_chunk(audio_buffer)
-                        audio_buffer = bytearray()
-                        is_speaking = False
-                        silence_counter = 0
-                        vad_buffer = bytearray()
-                        last_send_time = time.time()
-                
-                # Принудительная отправка через 10 сек (защита от зависания)
-                if len(audio_buffer) > 0 and (time.time() - last_send_time) >= FORCE_SEND_INTERVAL:
-                    self._process_chunk(audio_buffer)
-                    audio_buffer = bytearray()
-                    is_speaking = False
-                    silence_counter = 0
-                    vad_buffer = bytearray()
-                    last_send_time = time.time()
         except Exception as e:
             logging.error(f"Ошибка в потоковой записи: {e}")
         finally:
             stream.stop_stream()
             stream.close()
-            # Отправка остатка буфера
+            # Отправка всего буфера
             if len(audio_buffer) > 0:
-                self._process_chunk(audio_buffer)
+                buf_duration = len(audio_buffer) / 32000.0
+                logging.info(f"VAD [streaming NO VAD]: остаток буфера, чанк {len(audio_buffer)} байт (~{buf_duration:.1f} сек)")
+                self._process_chunk([bytes(audio_buffer)])
 
-    def _paste_text(self, text):
+    def _streaming_record(self):
+        """Стриминговая запись с Ten VAD (sherpa-onnx) — Вариант 2: всегда накапливать.
+        
+        Логика:
+        - ВСЕГДА добавляем аудио в accumulate_buffer (речь, пауза — всё)
+        - VAD используется ТОЛЬКО для определения моментов отправки (паузы)
+        - Отправка происходит АСИНХРОННО (в отдельном потоке) — запись не блокируется
+        
+       accumulate_buffer содержит ВСЁ аудио (включая паузы).
+        Внутренний VAD Whisper (Silero) уберёт паузы при распознавании.
+        """
+        use_vad_streaming = self.config.getboolean("Recognition", "use_vad_streaming", fallback=True)
+        
+        if not use_vad_streaming:
+            logging.info("VAD [streaming]: выключен (use_vad_streaming=false), запись без VAD")
+            return self._streaming_record_no_vad()
+        
+        if self._vad is None:
+            logging.error("Ten VAD модель не загружена, стриминг недоступен")
+            return
+        
+        vad = self._vad
+        
+        min_chunk_duration = self.config.getfloat("Recognition", "min_chunk_duration", fallback=3.0)
+        
+        logging.info(f"VAD [streaming Ten v2]: всегда накапливаем, VAD только для пауз, min_chunk={min_chunk_duration}s")
+        
+        last_send_time = time.time()
+        FORCE_SEND_INTERVAL = 10.0
+        
+        # Буфер накопления ВСЕГО аудио (байты)
+        accumulate_buffer = bytearray()
+        chunk_count = 0
+        
+        # Lock для защиты accumulate_buffer при асинхронной отправке
+        buffer_lock = threading.Lock()
+        
+        # Состояние VAD (только для определения пауз)
+        silence_counter = 0
+        
+        stream = self.audio.p.open(
+            format=self.audio.format,
+            channels=1,
+            rate=self.audio.rate,
+            input=True,
+            input_device_index=self.audio.device_index,
+            frames_per_buffer=self.audio.chunk,
+        )
+        
+        logging.info(f"VAD [streaming Ten v2]: частота записи: {self.audio.rate} Гц")
+        
+        debug_log_counter = 0
+        try:
+            while not self.stop_event.is_set() and self.is_running:
+                data = stream.read(self.audio.chunk, exception_on_overflow=False)
+                
+                # ВСЕГДА добавляем аудио в буфер
+                with buffer_lock:
+                    accumulate_buffer += data
+                
+                # Конвертируем в float32 для VAD
+                new_int16 = np.frombuffer(data, dtype=np.int16)
+                
+                # Применяем gain ДО VAD-обработки
+                if self.audio.gain != 1.0:
+                    new_float = (new_int16.astype(np.float32) * self.audio.gain).clip(-32768, 32767).astype(np.float32) / 32768.0
+                else:
+                    new_float = new_int16.astype(np.float32) / 32768.0
+                
+                # Подаём сэмплы в Ten VAD (только для определения пауз)
+                vad.accept_waveform(new_float)
+                
+                speech_detected = vad.is_speech_detected()
+                
+                debug_log_counter += 1
+                if debug_log_counter % 100 == 0:
+                    with buffer_lock:
+                        buf_len = len(accumulate_buffer)
+                    logging.debug(f"VAD [streaming Ten v2]: accumulate={buf_len} байт, speech={speech_detected}, silence={silence_counter}")
+                
+                # Логика VAD: только определяем паузы
+                if speech_detected:
+                    # Речь — сбрасываем счётчик тишины
+                    silence_counter = 0
+                else:
+                    # Тишина — считаем кадры
+                    silence_counter += 1
+                    
+                    if silence_counter >= 3:  # пауза подтверждена
+                        with buffer_lock:
+                            acc_duration = len(accumulate_buffer) / (self.audio.rate * 2)
+                        
+                        if acc_duration >= min_chunk_duration:
+                            # Копируем данные и очищаем буфер (под lock)
+                            with buffer_lock:
+                                chunk_data = bytes(accumulate_buffer)
+                                accumulate_buffer = bytearray()
+                            
+                            logging.info(f"VAD [streaming Ten v2]: отправка при паузе, {len(chunk_data)} байт (~{acc_duration:.1f} сек)")
+                            chunk_count += 1
+                            
+                            # АСИНХРОННАЯ отправка — запись не блокируется!
+                            threading.Thread(
+                                target=self._process_chunk,
+                                args=([chunk_data],),
+                                daemon=True
+                            ).start()
+                            
+                            last_send_time = time.time()
+                        else:
+                            logging.debug(f"VAD [streaming Ten v2]: чанк короткий ({acc_duration:.2f} сек < {min_chunk_duration} сек), накапливаем")
+                        
+                        # Сбрасываем счётчик тишины
+                        silence_counter = 0
+                
+                # Принудительная отправка через 10 сек
+                with buffer_lock:
+                    acc_len = len(accumulate_buffer)
+                if acc_len > 0 and (time.time() - last_send_time) >= FORCE_SEND_INTERVAL:
+                    with buffer_lock:
+                        acc_duration = len(accumulate_buffer) / (self.audio.rate * 2)
+                        chunk_data = bytes(accumulate_buffer)
+                        accumulate_buffer = bytearray()
+                    
+                    logging.info(f"VAD [streaming Ten v2]: принудительная отправка, {len(chunk_data)} байт (~{acc_duration:.1f} сек)")
+                    chunk_count += 1
+                    
+                    # АСИНХРОННАЯ отправка
+                    threading.Thread(
+                        target=self._process_chunk,
+                        args=([chunk_data],),
+                        daemon=True
+                    ).start()
+                    
+                    last_send_time = time.time()
+                    silence_counter = 0
+                
+                time.sleep(0.001)
+                    
+        except Exception as e:
+            logging.error(f"Ошибка в потоковой записи: {e}")
+        finally:
+            stream.stop_stream()
+            stream.close()
+            # Отправка остатка (БЕЗ проверки min_chunk_duration — отправляем всё!)
+            with buffer_lock:
+                if len(accumulate_buffer) > 0:
+                    chunk_data = bytes(accumulate_buffer)
+                    accumulate_buffer = bytearray()
+            
+            if chunk_data:
+                acc_duration = len(chunk_data) / (self.audio.rate * 2)
+                logging.info(f"VAD [streaming Ten v2]: остаток при остановке, {len(chunk_data)} байт (~{acc_duration:.1f} сек) — отправляем всё")
+                self._process_chunk([chunk_data])
+
+    def _paste_text(self, text, streaming=False):
         if not text or text.startswith("[Ошибка]"):
             logging.warning(f"Не вставляем текст: {text}")
             return
+        # Логирование вставки (задача 16: добавлено время)
+        mode_label = "streaming" if streaming else "record"
+        preview = text[:50].replace('\n', ' ')
+        ts = time.strftime("%H:%M:%S")
+        logging.info(f"[{ts}] Вставка текста [{mode_label}]: '{preview}...' (длина {len(text)})")
+        
         pyperclip.copy(text)
         time.sleep(0.15)
         if KEYBOARD_AVAILABLE:
@@ -658,6 +946,7 @@ class DictationCore:
         else:
             pyautogui.hotkey("ctrl", "v", interval=0.1)
             logging.info("Вставка через pyautogui.hotkey")
+        
         # Очистка буфера обмена после вставки
         time.sleep(0.1)
         pyperclip.copy("")
@@ -787,7 +1076,11 @@ class SettingsWindow:
         self.core = core
         self.hotkey_manager = hotkey_manager
         self.root.title("Whisper Dictation - Настройки")
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
+        self.root.geometry("850x550")
+
+        # Создаём hotkey_var ДО вызова _build_*_tab() чтобы _save_config() мог его использовать
+        self.hotkey_var = tk.StringVar(value=self.config["Hotkeys"]["hotkey"])
 
         notebook = ttk.Notebook(root)
         notebook.pack(fill="both", expand=True, padx=10, pady=10)
@@ -803,27 +1096,52 @@ class SettingsWindow:
         self._build_audio_tab()
         self._build_hotkeys_tab()
 
+    def _set_tooltip(self, widget, text):
+        """Добавляет всплывающую подсказку к виджету."""
+        def _on_enter(e):
+            self._tooltip = tk.Toplevel(widget)
+            self._tooltip.wm_overrideredirect(True)
+            self._tooltip.wm_geometry(f"+{e.x_root+10}+{e.y_root+10}")
+            label = tk.Label(self._tooltip, text=text, justify=tk.LEFT,
+                            background="#ffffe0", relief="solid", borderwidth=1,
+                            font=("Segoe UI", 8), wraplength=300)
+            label.pack()
+        def _on_leave(e):
+            if hasattr(self, '_tooltip'):
+                self._tooltip.destroy()
+                del self._tooltip
+        widget.bind("<Enter>", _on_enter)
+        widget.bind("<Leave>", _on_leave)
+
     def _build_engine_tab(self):
         row = 0
-        ttk.Label(self.tab_engine, text="Путь к whisper-cli (GPU):").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+        lbl = ttk.Label(self.tab_engine, text="Путь к whisper-cli (GPU):")
+        lbl.grid(row=row, column=0, sticky="w", padx=5, pady=2)
+        self._set_tooltip(lbl, "Путь к исполняемому файлу whisper-cli для GPU (Vulkan)")
         self.gpu_path_var = tk.StringVar(value=self.config["Paths"]["whisper_gpu"])
         ttk.Entry(self.tab_engine, textvariable=self.gpu_path_var, width=60).grid(row=row, column=1, padx=5)
         ttk.Button(self.tab_engine, text="Обзор", command=lambda: self._browse_file(self.gpu_path_var)).grid(row=row, column=2)
         row += 1
 
-        ttk.Label(self.tab_engine, text="Путь к whisper-cli (CPU):").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+        lbl = ttk.Label(self.tab_engine, text="Путь к whisper-cli (CPU):")
+        lbl.grid(row=row, column=0, sticky="w", padx=5, pady=2)
+        self._set_tooltip(lbl, "Путь к исполняемому файлу whisper-cli для CPU")
         self.cpu_path_var = tk.StringVar(value=self.config["Paths"]["whisper_cpu"])
         ttk.Entry(self.tab_engine, textvariable=self.cpu_path_var, width=60).grid(row=row, column=1, padx=5)
         ttk.Button(self.tab_engine, text="Обзор", command=lambda: self._browse_file(self.cpu_path_var)).grid(row=row, column=2)
         row += 1
 
-        ttk.Label(self.tab_engine, text="Путь к модели:").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+        lbl = ttk.Label(self.tab_engine, text="Путь к модели:")
+        lbl.grid(row=row, column=0, sticky="w", padx=5, pady=2)
+        self._set_tooltip(lbl, "Путь к файлу модели Whisper (.bin)")
         self.model_path_var = tk.StringVar(value=self.config["Paths"]["model"])
         ttk.Entry(self.tab_engine, textvariable=self.model_path_var, width=60).grid(row=row, column=1, padx=5)
         ttk.Button(self.tab_engine, text="Обзор", command=lambda: self._browse_file(self.model_path_var)).grid(row=row, column=2)
         row += 1
 
-        ttk.Label(self.tab_engine, text="Индекс GPU (--device):").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+        lbl = ttk.Label(self.tab_engine, text="Индекс GPU (--device):")
+        lbl.grid(row=row, column=0, sticky="w", padx=5, pady=2)
+        self._set_tooltip(lbl, "0=первая GPU, 1=вторая GPU. Определяется автоматически")
         gpu_idx_value = self._detect_gpu_index()
         self.gpu_idx_var = tk.StringVar(value=gpu_idx_value)
         gpu_combo = ttk.Combobox(self.tab_engine, textvariable=self.gpu_idx_var,
@@ -832,28 +1150,36 @@ class SettingsWindow:
         ttk.Label(self.tab_engine, text="(0=первая GPU)").grid(row=row, column=2, sticky="w", padx=5)
         row += 1
 
-        ttk.Label(self.tab_engine, text="Устройство:").grid(row=row, column=0, sticky="w", padx=5, pady=5)
+        lbl = ttk.Label(self.tab_engine, text="Устройство:")
+        lbl.grid(row=row, column=0, sticky="w", padx=5, pady=5)
+        self._set_tooltip(lbl, "GPU=быстрее, CPU=медленнее, но работает без GPU")
         self.device_var = tk.StringVar(value=self.config["Recognition"]["device"])
         combo = ttk.Combobox(self.tab_engine, textvariable=self.device_var,
                              values=["gpu", "cpu"], state="readonly", width=10)
         combo.grid(row=row, column=1, sticky="w", padx=5)
         row += 1
 
-        ttk.Label(self.tab_engine, text="Метод транскрипции:").grid(row=row, column=0, sticky="w", padx=5, pady=5)
+        lbl = ttk.Label(self.tab_engine, text="Метод транскрипции:")
+        lbl.grid(row=row, column=0, sticky="w", padx=5, pady=5)
+        self._set_tooltip(lbl, "whisper-cli: локальный процесс, загружает модель для каждого файла. whisper-server: локальный HTTP-сервер, модель всегда в GPU, генерация мгновенная. Сервер запускается автоматически")
         self.method_var = tk.StringVar(value=self.config["Recognition"].get("method", "whisper-cli"))
         method_combo = ttk.Combobox(self.tab_engine, textvariable=self.method_var,
                                     values=["whisper-cli", "whisper-server"], state="readonly", width=15)
         method_combo.grid(row=row, column=1, sticky="w", padx=5)
         row += 1
 
-        ttk.Label(self.tab_engine, text="Путь к whisper-server.exe:").grid(row=row, column=0, sticky="w", padx=5, pady=2)
+        lbl = ttk.Label(self.tab_engine, text="Путь к whisper-server.exe:")
+        lbl.grid(row=row, column=0, sticky="w", padx=5, pady=2)
+        self._set_tooltip(lbl, "Путь к исполняемому файлу whisper-server (локальный HTTP-сервер)")
         self.server_path_var = tk.StringVar(value=self.config["Paths"].get("server_path", "whisper-vulkan-Server\\whisper-server.exe"))
         ttk.Entry(self.tab_engine, textvariable=self.server_path_var, width=60).grid(row=row, column=1, padx=5)
         ttk.Button(self.tab_engine, text="Обзор", command=lambda: self._browse_file(self.server_path_var)).grid(row=row, column=2)
         row += 1
 
-        ttk.Label(self.tab_engine, text="URL сервера:").grid(row=row, column=0, sticky="w", padx=5, pady=2)
-        self.server_url_var = tk.StringVar(value=self.config["Recognition"].get("server_url", "http://127.0.0.1:8080/inference"))
+        lbl = ttk.Label(self.tab_engine, text="URL сервера:")
+        lbl.grid(row=row, column=0, sticky="w", padx=5, pady=2)
+        self._set_tooltip(lbl, "Адрес локального HTTP-сервера whisper-server для транскрипции. По умолчанию http://127.0.0.1:18877/inference")
+        self.server_url_var = tk.StringVar(value=self.config["Recognition"].get("server_url", "http://127.0.0.1:18877/inference"))
         ttk.Entry(self.tab_engine, textvariable=self.server_url_var, width=50).grid(row=row, column=1, sticky="w", padx=5)
 
         for var in (self.gpu_path_var, self.cpu_path_var, self.model_path_var, self.gpu_idx_var, self.server_path_var):
@@ -863,20 +1189,26 @@ class SettingsWindow:
         self.server_url_var.trace_add("write", lambda *a: self._save_config())
 
     def _build_audio_tab(self):
-        ttk.Label(self.tab_audio, text="Режим работы:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        lbl = ttk.Label(self.tab_audio, text="Режим работы:")
+        lbl.grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        self._set_tooltip(lbl, "record_then_analyze: запись → стоп → распознавание. streaming: распознавание в реальном времени по паузам")
         self.mode_var = tk.StringVar(value=self.config["Recognition"]["mode"])
         combo = ttk.Combobox(self.tab_audio, textvariable=self.mode_var,
                              values=["record_then_analyze", "streaming"], state="readonly", width=20)
         combo.grid(row=0, column=1, sticky="w", padx=5)
 
-        ttk.Label(self.tab_audio, text="Частота дискретизации:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+        lbl = ttk.Label(self.tab_audio, text="Частота дискретизации:")
+        lbl.grid(row=1, column=0, sticky="w", padx=5, pady=5)
+        self._set_tooltip(lbl, "16000 Гц рекомендуется для Whisper. 48000 Гц — высокое качество, но медленнее")
         self.sample_rate_var = tk.StringVar(value=self.config["Audio"].get("sample_rate", "16000"))
         sr_combo = ttk.Combobox(self.tab_audio, textvariable=self.sample_rate_var,
                                 values=["16000", "48000"], state="readonly", width=10)
         sr_combo.grid(row=1, column=1, sticky="w", padx=5)
         ttk.Label(self.tab_audio, text="(16000 рекомендуется)").grid(row=1, column=2, sticky="w", padx=5)
 
-        ttk.Label(self.tab_audio, text="Усиление (Gain):").grid(row=2, column=0, sticky="w", padx=5, pady=5)
+        lbl = ttk.Label(self.tab_audio, text="Усиление (Gain):")
+        lbl.grid(row=2, column=0, sticky="w", padx=5, pady=5)
+        self._set_tooltip(lbl, "Усиление микрофона. 1.0=без усиления, 10.0=максимум. Помогает при тихом микрофоне")
         self.gain_var = tk.DoubleVar(value=float(self.config["Audio"]["gain"]))
         scale = ttk.Scale(self.tab_audio, from_=1.0, to=10.0, variable=self.gain_var,
                           orient="horizontal", command=lambda v: self._save_config())
@@ -884,22 +1216,136 @@ class SettingsWindow:
         ttk.Label(self.tab_audio, textvariable=self.gain_var).grid(row=2, column=2, padx=5)
 
         self.mic_info = tk.StringVar(value=self._get_mic_info())
-        ttk.Label(self.tab_audio, text="Микрофон:").grid(row=3, column=0, sticky="w", padx=5, pady=5)
+        lbl = ttk.Label(self.tab_audio, text="Микрофон:")
+        lbl.grid(row=3, column=0, sticky="w", padx=5, pady=5)
+        self._set_tooltip(lbl, "Информация о микрофоне по умолчанию")
         ttk.Label(self.tab_audio, textvariable=self.mic_info).grid(row=3, column=1, sticky="w", padx=5)
 
-        # Чекбокс VAD (Silero)
-        self.vad_var = tk.BooleanVar(value=self.config.getboolean("Recognition", "use_vad", fallback=False))
-        ttk.Checkbutton(self.tab_audio, text="VAD (улучшает качество при паузах)", variable=self.vad_var).grid(row=4, column=1, sticky="w", padx=5, pady=5)
-        ttk.Label(self.tab_audio, text="VAD:").grid(row=4, column=0, sticky="w", padx=5, pady=5)
+        # === Внутренний VAD (Silero для whisper-cli/server) ===
+        lbl = ttk.Label(self.tab_audio, text="VAD:")
+        lbl.grid(row=4, column=0, sticky="w", padx=5, pady=5)
+        self._set_tooltip(lbl, "Включает Silero VAD в whisper-cli/server. Убирает тишину из аудио перед распознаванием. Включено по умолчанию")
+        self.vad_var = tk.BooleanVar(value=self.config.getboolean("Recognition", "use_vad", fallback=True))
+        chk = ttk.Checkbutton(self.tab_audio, text="VAD (внутренний, Silero для whisper-cli/server)", variable=self.vad_var)
+        chk.grid(row=4, column=1, sticky="w", padx=5, pady=5)
+
+        # Vad Threshold для внутреннего VAD
+        lbl = ttk.Label(self.tab_audio, text="Vad Threshold:")
+        lbl.grid(row=5, column=0, sticky="w", padx=5, pady=2)
+        self._set_tooltip(lbl, "Vad Threshold — порог уверенности для Внутреннего VAD (Silero в whisper-cli/server).\n\n"
+                               "Как это работает: VAD анализирует аудио и выставляет оценку от 0.0 до 1.0 для каждого фрагмента. Если оценка выше порога — фрагмент считается речью и отправляется Whisper для распознавания. Если ниже — считается тишиной и отбрасывается.\n\n"
+                               "Меньше значение (0.3) = VAD более чувствительный, отправляет больше аудио (включая фоновый шум), но не пропускает тихую речь\n"
+                               "Больше значение (0.8) = VAD строже, отправляет только уверенную речь, но может обрезать начало/конец фраз\n\n"
+                               "Не влияет на внешний VAD (Ten VAD для стриминга) — у него свой Vad Threshold.\n\n"
+                               "По умолчанию 0.5")
+        self.vad_threshold_var = tk.DoubleVar(value=self.config.getfloat("Recognition", "vad_threshold", fallback=0.5))
+        vad_threshold_scale = ttk.Scale(self.tab_audio, from_=0.0, to=1.0, variable=self.vad_threshold_var,
+                                        orient="horizontal", command=lambda v: (self._round_vad_threshold(v), self._save_config()))
+        vad_threshold_scale.grid(row=5, column=1, sticky="we", padx=5)
+        ttk.Label(self.tab_audio, textvariable=self.vad_threshold_var).grid(row=5, column=2, sticky="w", padx=5)
+        ttk.Label(self.tab_audio, text="0=чувствительный, 1=строгий", foreground="gray", font=("Segoe UI", 7)).grid(row=5, column=3, sticky="w", padx=2)
+
+        # === Внешний VAD (Ten VAD для стриминга) ===
+        row = 6
+        lbl = ttk.Label(self.tab_audio, text="VAD (внешний, Ten VAD для стриминга):")
+        lbl.grid(row=row, column=0, sticky="w", padx=5, pady=(10, 2))
+        self._set_tooltip(lbl, "Включает Ten VAD для определения пауз в режиме стриминга. Весь аудио всегда накапливается (включая паузы). VAD только решает, когда отправить чанк на распознавание. Внутренний VAD (Silero) уберёт паузы из аудио при распознавании")
+        row += 1
+
+        self.vad_streaming_var = tk.BooleanVar(value=self.config.getboolean("Recognition", "use_vad_streaming", fallback=True))
+        chk2 = ttk.Checkbutton(self.tab_audio, text="VAD (внешний, Ten VAD для стриминга)", variable=self.vad_streaming_var)
+        chk2.grid(row=row, column=1, columnspan=3, sticky="w", padx=5, pady=2)
+        row += 1
+
+        # Vad Threshold
+        lbl = ttk.Label(self.tab_audio, text="Vad Threshold:")
+        lbl.grid(row=row, column=0, sticky="w", padx=5, pady=2)
+        self._set_tooltip(lbl, "Порог уверенности для детекции речи. Чем меньше — тем чувствительнее VAD к тихой речи, но может реагировать на шум. Чем больше — тем строже.\n\n"
+                               "0.3 = очень чувствительный\n"
+                               "0.5 = рекомендуемое значение\n"
+                               "0.7 = строгий, только уверенную речь")
+        self.vad_enter_threshold_var = tk.DoubleVar(value=self.config.getfloat("Recognition", "vad_threshold", fallback=0.5))
+        vad_enter_scale = ttk.Scale(self.tab_audio, from_=0.3, to=0.7, variable=self.vad_enter_threshold_var,
+                                    orient="horizontal", command=lambda v: (self._round_enter_threshold(v), self._save_config()))
+        vad_enter_scale.grid(row=row, column=1, sticky="we", padx=5)
+        ttk.Label(self.tab_audio, textvariable=self.vad_enter_threshold_var).grid(row=row, column=2, sticky="w", padx=5)
+        ttk.Label(self.tab_audio, text="(0.3-0.7)", foreground="gray", font=("Segoe UI", 7)).grid(row=row, column=3, sticky="w", padx=2)
+        row += 1
+
+        # Min Silence Duration
+        lbl = ttk.Label(self.tab_audio, text="Min Silence Duration:")
+        lbl.grid(row=row, column=0, sticky="w", padx=5, pady=2)
+        self._set_tooltip(lbl, "Минимальная пауза тишины (в секундах), после которой VAD фиксирует конец речи и отправляет чанк на распознавание.\n\n"
+                               "Меньше = быстрее отправка, но возможны ложные паузы\n"
+                               "Больше = медленнее, но текст более плавный\n\n"
+                               "По умолчанию 0.7 сек.")
+        self.vad_silence_var = tk.DoubleVar(value=self.config.getfloat("Recognition", "vad_min_silence_duration", fallback=0.7))
+        vad_silence_scale = ttk.Scale(self.tab_audio, from_=0.3, to=2.0, variable=self.vad_silence_var,
+                                      orient="horizontal", command=lambda v: (self._round_silence(v), self._save_config()))
+        vad_silence_scale.grid(row=row, column=1, sticky="we", padx=5)
+        ttk.Label(self.tab_audio, textvariable=self.vad_silence_var).grid(row=row, column=2, sticky="w", padx=5)
+        ttk.Label(self.tab_audio, text="сек", foreground="gray", font=("Segoe UI", 7)).grid(row=row, column=3, sticky="w", padx=2)
+        row += 1
+
+        # Min Speech Duration
+        lbl = ttk.Label(self.tab_audio, text="Min Speech Duration:")
+        lbl.grid(row=row, column=0, sticky="w", padx=5, pady=2)
+        self._set_tooltip(lbl, "Минимальная длительность речи для учёта. Если VAD обнаружил речь короче этого времени — она считается шумом и игнорируется.\n\n"
+                               "Меньше = чувствительнее (ловит короткие слова)\n"
+                               "Больше = строже (игнорирует короткие всплески шума)\n\n"
+                               "По умолчанию 0.25 сек.")
+        self.min_speech_frames_var = tk.DoubleVar(value=self.config.getfloat("Recognition", "vad_min_speech_duration", fallback=0.25))
+        min_speech_scale = ttk.Scale(self.tab_audio, from_=0.1, to=1.0, variable=self.min_speech_frames_var,
+                                     orient="horizontal", command=lambda v: (self._round_min_speech(v), self._save_config()))
+        min_speech_scale.grid(row=row, column=1, sticky="we", padx=5)
+        self.min_speech_label_var = tk.StringVar(value=f"{self.min_speech_frames_var.get() * 1000:.0f}мс")
+        ttk.Label(self.tab_audio, textvariable=self.min_speech_label_var).grid(row=row, column=2, sticky="w", padx=5)
+        ttk.Label(self.tab_audio, text="(100мс-1000мс)", foreground="gray", font=("Segoe UI", 7)).grid(row=row, column=3, sticky="w", padx=2)
+        row += 1
+
+        # Min Chunk Duration (НОВАЯ настройка)
+        lbl = ttk.Label(self.tab_audio, text="Min Chunk Duration:")
+        lbl.grid(row=row, column=0, sticky="w", padx=5, pady=2)
+        self._set_tooltip(lbl, "Минимальная длительность накопленного чанка для отправки на распознавание. Если чанк короче — он накапливается к следующему.\n\n"
+                               "Весь аудио всегда накапливается (речь + паузы). VAD определяет только моменты отправки.\n\n"
+                               "Меньше = быстрее отправка, но «рваный» текст\n"
+                               "Больше = плавнее текст, но задержка при коротких фразах\n\n"
+                               "По умолчанию 3.0 сек.")
+        self.vad_chunk_duration_var = tk.DoubleVar(value=self.config.getfloat("Recognition", "min_chunk_duration", fallback=3.0))
+        vad_chunk_scale = ttk.Scale(self.tab_audio, from_=0.5, to=5.0, variable=self.vad_chunk_duration_var,
+                                    orient="horizontal", command=lambda v: (self._round_chunk_duration(v), self._save_config()))
+        vad_chunk_scale.grid(row=row, column=1, sticky="we", padx=5)
+        ttk.Label(self.tab_audio, textvariable=self.vad_chunk_duration_var).grid(row=row, column=2, sticky="w", padx=5)
+        ttk.Label(self.tab_audio, text="сек", foreground="gray", font=("Segoe UI", 7)).grid(row=row, column=3, sticky="w", padx=2)
+        row += 1
+
+        # Сохраняем ссылки на виджеты для активации/деактивации
+        self._vad_enter_scale = vad_enter_scale
+        self._vad_silence_scale = vad_silence_scale
+        self._vad_threshold_scale = vad_threshold_scale
+        self._vad_streaming_chk = chk2
+        self._min_speech_scale = min_speech_scale
+        self._vad_chunk_scale = vad_chunk_scale
 
         self.mode_var.trace_add("write", lambda *a: self._on_mode_change())
         self.sample_rate_var.trace_add("write", lambda *a: self._save_config())
         self.gain_var.trace_add("write", lambda *a: self._save_config())
-        self.vad_var.trace_add("write", lambda *a: self._save_config())
+        self.vad_var.trace_add("write", lambda *a: self._on_vad_change())
+        self.vad_threshold_var.trace_add("write", lambda *a: self._save_config())
+        self.vad_streaming_var.trace_add("write", lambda *a: self._on_vad_streaming_change())
+        self.vad_enter_threshold_var.trace_add("write", lambda *a: self._save_config())
+        self.vad_silence_var.trace_add("write", lambda *a: self._save_config())
+        self.min_speech_frames_var.trace_add("write", lambda *a: self._save_config())
+        self.vad_chunk_duration_var.trace_add("write", lambda *a: self._save_config())
+
+        # Инициализация состояния VAD-виджетов
+        self._update_vad_widgets()
+        self._update_vad_streaming_widgets()
 
         # Авто-включение VAD при стриминге
         if self.mode_var.get() == "streaming":
             self.vad_var.set(True)
+            self.vad_streaming_var.set(True)
 
         # Привязка изменения метода транскрипции — whisper-server = только GPU
         self.method_var.trace_add("write", lambda *a: self._on_method_change())
@@ -908,15 +1354,41 @@ class SettingsWindow:
         try:
             p = pyaudio.PyAudio()
             info = p.get_default_input_device_info()
-            txt = f"{info['name']} ({int(info['defaultSampleRate'])} Гц, {info['maxInputChannels']} кан.)"
+            name = info['name']
+            # Исправление кодировки: PyAudio может вернуть OEM-кодировку (CP866)
+            if isinstance(name, str):
+                # Проверяем: содержит ли имя не-ASCII символы?
+                has_non_ascii = any(ord(c) > 127 for c in name)
+                if has_non_ascii:
+                    # Попробуем декодировать как CP866 → UTF-8
+                    try:
+                        decoded = name.encode('cp866', errors='strict').decode('utf-8', errors='strict')
+                        if decoded.isprintable() and len(decoded) < 200:
+                            name = decoded
+                    except (UnicodeEncodeError, UnicodeDecodeError):
+                        # Если CP866 не подошло — пробуем CP1251 → UTF-8
+                        try:
+                            decoded = name.encode('cp1251', errors='strict').decode('utf-8', errors='strict')
+                            if decoded.isprintable():
+                                name = decoded
+                        except (UnicodeEncodeError, UnicodeDecodeError):
+                            # Если ничего не подошло — пробуем CP1251 с игнором ошибок
+                            try:
+                                decoded = name.encode('cp1251', errors='ignore').decode('utf-8', errors='ignore')
+                                if decoded.isprintable():
+                                    name = decoded
+                            except:
+                                pass  # оставляем оригинальное имя
+            txt = f"{name} ({int(info['defaultSampleRate'])} Гц, {info['maxInputChannels']} кан.)"
             p.terminate()
             return txt
         except:
             return "Не удалось получить"
 
     def _build_hotkeys_tab(self):
-        ttk.Label(self.tab_hotkeys, text="Горячая клавиша:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        self.hotkey_var = tk.StringVar(value=self.config["Hotkeys"]["hotkey"])
+        lbl = ttk.Label(self.tab_hotkeys, text="Горячая клавиша:")
+        lbl.grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        self._set_tooltip(lbl, "Клавиша или комбинация для начала/остановки записи. Нажатие=старт, отпускание=стоп+распознавание")
         self.hotkey_entry = ttk.Entry(self.tab_hotkeys, textvariable=self.hotkey_var, width=20)
         self.hotkey_entry.grid(row=0, column=1, sticky="w", padx=5)
         ttk.Button(self.tab_hotkeys, text="Запомнить", command=self._capture_hotkey).grid(row=0, column=2, padx=5)
@@ -1022,10 +1494,83 @@ class SettingsWindow:
             return "0"
 
     def _on_mode_change(self):
-        """Авто-включение VAD при стриминге."""
-        if self.mode_var.get() == "streaming":
-            self.vad_var.set(True)
+        """Переключение VAD при смене режима.
+        
+        record_then_analyze: внутренний VAD = ВКЛ, внешний VAD = ВЫКЛ
+        streaming: внутренний VAD = ВКЛ (убирает паузы из аудио), внешний VAD = ВКЛ (определяет паузы)
+        
+        Внутренний VAD (Silero) включён ВСЕГДА — он убирает тишину из аудио перед распознаванием.
+        Внешний VAD (Ten VAD) включён только в стриминге — определяет когда отправлять чанки.
+        """
+        is_streaming = self.mode_var.get() == "streaming"
+        if is_streaming:
+            self.vad_var.set(True)             # включить внутренний VAD (убирает паузы из аудио)
+            self.vad_streaming_var.set(True)   # включить внешний VAD (определяет паузы)
+        else:
+            self.vad_var.set(True)             # включить внутренний VAD
+            self.vad_streaming_var.set(False)  # выключить внешний VAD
+        # Обновляем виджеты
+        self._update_vad_widgets()
+        self._update_vad_streaming_visibility()
         self._save_config()
+
+    def _update_vad_streaming_visibility(self):
+        """Показывает/скрывает настройки внешнего VAD в зависимости от режима."""
+        is_streaming = self.mode_var.get() == "streaming"
+        state = "normal" if is_streaming else "disabled"
+        self._vad_streaming_chk.configure(state=state)
+        self._vad_enter_scale.configure(state=state)
+        self._vad_silence_scale.configure(state=state)
+        self._min_speech_scale.configure(state=state)
+        self._vad_chunk_scale.configure(state=state)
+        # Если переключились на record_then_analyze — деактивируем галочку
+        if not is_streaming:
+            self.vad_streaming_var.set(False)
+
+    def _on_vad_change(self):
+        """При изменении галочки внутреннего VAD — активировать/деактивировать Vad Threshold."""
+        self._update_vad_widgets()
+        self._save_config()
+
+    def _on_vad_streaming_change(self):
+        """При изменении галочки внешнего VAD — активировать/деактивировать настройки стриминга."""
+        self._update_vad_streaming_widgets()
+        self._save_config()
+
+    def _update_vad_widgets(self):
+        """Активирует/деактивирует настройки внутреннего VAD в зависимости от галочки."""
+        state = "normal" if self.vad_var.get() else "disabled"
+        self._vad_threshold_scale.configure(state=state)
+
+    def _update_vad_streaming_widgets(self):
+        """Активирует/деактивирует настройки внешнего VAD в зависимости от галочки."""
+        state = "normal" if self.vad_streaming_var.get() else "disabled"
+        self._vad_enter_scale.configure(state=state)
+        self._vad_silence_scale.configure(state=state)
+        self._min_speech_scale.configure(state=state)
+        self._vad_chunk_scale.configure(state=state)
+
+    def _round_silence(self, value):
+        """Округляет значение порога тишины до 2 знаков."""
+        self.vad_silence_var.set(round(float(value), 2))
+
+    def _round_vad_threshold(self, value):
+        """Округляет значение Vad Threshold до 2 знаков."""
+        self.vad_threshold_var.set(round(float(value), 2))
+
+    def _round_min_speech(self, value):
+        """Округляет значение vad_min_speech_duration до 2 знаков и обновляет label."""
+        duration = round(float(value), 2)
+        self.min_speech_frames_var.set(duration)
+        self.min_speech_label_var.set(f"{duration * 1000:.0f}мс")
+
+    def _round_enter_threshold(self, value):
+        """Округляет значение Vad Enter Threshold до 2 знаков."""
+        self.vad_enter_threshold_var.set(round(float(value), 2))
+
+    def _round_chunk_duration(self, value):
+        """Округляет значение min_chunk_duration до 2 знаков."""
+        self.vad_chunk_duration_var.set(round(float(value), 2))
 
     def _on_method_change(self):
         """При выборе whisper-server — только GPU."""
@@ -1058,28 +1603,170 @@ class SettingsWindow:
 
     def _save_config(self):
         try:
-            self.config["Paths"]["whisper_gpu"] = self.gpu_path_var.get()
-            self.config["Paths"]["whisper_cpu"] = self.cpu_path_var.get()
-            self.config["Paths"]["model"] = self.model_path_var.get()
-            self.config["Paths"]["gpu_device_index"] = self.gpu_idx_var.get().strip() or "1"
-            self.config["Paths"]["server_path"] = self.server_path_var.get().strip()
-            self.config["Recognition"]["device"] = self.device_var.get()
-            self.config["Recognition"]["mode"] = self.mode_var.get()
-            self.config["Recognition"]["method"] = self.method_var.get()
-            self.config["Recognition"]["server_url"] = self.server_url_var.get().strip()
-            self.config["Audio"]["gain"] = str(self.gain_var.get())
-            self.config["Audio"]["sample_rate"] = self.sample_rate_var.get()
-            self.config["Recognition"]["use_vad"] = str(self.vad_var.get()).lower()
-            self.config["Hotkeys"]["hotkey"] = self.hotkey_var.get().strip()
+            # Собираем изменения для логирования
+            changes = []
+            settings_map = [
+                ("Paths", "whisper_gpu", self.gpu_path_var),
+                ("Paths", "whisper_cpu", self.cpu_path_var),
+                ("Paths", "model", self.model_path_var),
+                ("Paths", "gpu_device_index", lambda: self.gpu_idx_var.get().strip() or "1"),
+                ("Paths", "server_path", lambda: self.server_path_var.get().strip()),
+                ("Recognition", "device", self.device_var),
+                ("Recognition", "mode", self.mode_var),
+                ("Recognition", "method", self.method_var),
+                ("Recognition", "server_url", lambda: self.server_url_var.get().strip()),
+                ("Audio", "gain", lambda: str(self.gain_var.get())),
+                ("Audio", "sample_rate", self.sample_rate_var),
+                ("Recognition", "use_vad", lambda: str(self.vad_var.get()).lower()),
+                ("Recognition", "vad_threshold", lambda: str(self.vad_threshold_var.get())),
+                ("Recognition", "use_vad_streaming", lambda: str(self.vad_streaming_var.get()).lower()),
+                ("Recognition", "vad_min_silence_duration", lambda: str(self.vad_silence_var.get())),
+                ("Recognition", "vad_min_speech_duration", lambda: str(self.min_speech_frames_var.get())),
+                ("Recognition", "min_chunk_duration", lambda: str(self.vad_chunk_duration_var.get())),
+                ("Hotkeys", "hotkey", lambda: self.hotkey_var.get().strip()),
+            ]
+            for section, key, getter in settings_map:
+                new_val = getter() if callable(getter) else getter.get()
+                old_val = self.config.get(section, key, fallback="<не задано>")
+                if str(new_val) != str(old_val):
+                    changes.append(f"  {section}.{key}: {old_val} → {new_val}")
+                    self.config[section][key] = str(new_val)
+                else:
+                    self.config[section][key] = str(new_val)
             save_config(self.config)
             self.core.update_settings(self.config)
             self.hotkey_manager.restart_listeners()
-            logging.info("Настройки сохранены и применены")
+            if changes:
+                logging.info("Изменены настройки:\n" + "\n".join(changes))
+            else:
+                logging.info("Настройки сохранены")
             # Уведомление с автоскрытием через 0.5 сек
             self._show_temp_notification("Настройки сохранены и применены")
         except Exception as e:
             logging.error(f"Ошибка сохранения: {e}")
             messagebox.showerror("Ошибка", f"Не удалось сохранить настройки: {e}")
+
+# ----------------------------------------------------------------------
+# Окно "Выбрать аудиофайл"
+# ----------------------------------------------------------------------
+class AudioFileWindow:
+    """Окно для распознавания аудиофайлов через Whisper."""
+
+    def __init__(self, root, runner, parent_root):
+        self.root = root
+        self.runner = runner
+        self.parent_root = parent_root  # основной root для _show_toast
+        self.root.title("Whisper Dictation — Распознавание аудиофайла")
+        self.root.geometry("600x500")
+        self.root.resizable(True, True)
+
+        # Row 0: панель выбора файла
+        frame_top = ttk.Frame(root, padding=10)
+        frame_top.grid(row=0, column=0, sticky="ew")
+
+        ttk.Label(frame_top, text="Аудиофайл:").grid(row=0, column=0, sticky="w", padx=(0, 5))
+        self.file_path_var = tk.StringVar()
+        ttk.Entry(frame_top, textvariable=self.file_path_var, width=40).grid(row=0, column=1, padx=5)
+        ttk.Button(frame_top, text="Выбрать файл", command=self._browse_file).grid(row=0, column=2, padx=2)
+
+        # Row 1: кнопка "Распознать" + статус
+        frame_btn = ttk.Frame(root, padding=(10, 5))
+        frame_btn.grid(row=1, column=0, sticky="ew")
+
+        self.btn_transcribe = ttk.Button(frame_btn, text="Распознать", command=self._transcribe_file)
+        self.btn_transcribe.grid(row=0, column=0, sticky="w")
+
+        # Статус (индикатор состояния, не кнопка)
+        self.status_var = tk.StringVar(value="Готово")
+        ttk.Label(frame_btn, textvariable=self.status_var, foreground="gray",
+                  font=("Segoe UI", 8)).grid(row=0, column=1, sticky="e", padx=(20, 0))
+
+        # Row 3: текстовое поле + скролл
+        frame_text = ttk.Frame(root, padding=(10, 5))
+        frame_text.grid(row=2, column=0, sticky="nsew")
+
+        self.text_var = tk.Text(frame_text, wrap="word", state="disabled", font=("Consolas", 10), height=15)
+        scrollbar = ttk.Scrollbar(frame_text, orient="vertical", command=self.text_var.yview)
+        self.text_var.configure(yscrollcommand=scrollbar.set)
+        self.text_var.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        # Row 4: кнопки внизу
+        frame_bottom = ttk.Frame(root, padding=10)
+        frame_bottom.grid(row=3, column=0, sticky="ew")
+
+        ttk.Button(frame_bottom, text="Скопировать всё", command=self._copy_all).grid(row=0, column=0, padx=5)
+        ttk.Button(frame_bottom, text="Очистить", command=self._clear_text).grid(row=0, column=1, padx=5)
+
+        # Настройка весов для растягивания
+        root.grid_rowconfigure(2, weight=1)
+        root.grid_columnconfigure(0, weight=1)
+        frame_text.grid_rowconfigure(0, weight=1)
+        frame_text.grid_columnconfigure(0, weight=1)
+
+    def _browse_file(self):
+        """Открывает диалог выбора аудиофайла."""
+        filepath = filedialog.askopenfilename(
+            title="Выберите аудиофайл",
+            filetypes=[
+                ("Аудиофайлы", "*.wav *.mp3 *.flac *.ogg"),
+                ("Все файлы", "*.*"),
+            ],
+        )
+        if filepath:
+            self.file_path_var.set(filepath)
+
+    def _transcribe_file(self):
+        """Распознаёт выбранный аудиофайл и добавляет результат в текстовое поле."""
+        filepath = self.file_path_var.get().strip()
+        if not filepath:
+            self.status_var.set("Ошибка: не выбран файл")
+            return
+        if not os.path.exists(filepath):
+            self.status_var.set(f"Ошибка: файл не найден — {filepath}")
+            return
+
+        self.status_var.set("Распознаю...")
+        self.btn_transcribe.configure(state="disabled")
+
+        def _work():
+            try:
+                text = self.runner.transcribe(filepath)
+                # Добавляем текст в поле
+                self.root.after(0, lambda: self._append_text(text))
+            except Exception as e:
+                logging.error(f"Ошибка распознавания файла {filepath}: {e}")
+                self.root.after(0, lambda: self._append_text(f"[Ошибка: {e}]"))
+            finally:
+                self.root.after(0, lambda: (
+                    self.btn_transcribe.configure(state="normal"),
+                    self.status_var.set("Готово"),
+                ))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _append_text(self, text):
+        """Добавляет текст в текстовое поле с разделителем."""
+        self.text_var.configure(state="normal")
+        current = self.text_var.get("1.0", "end-1c")
+        if current.strip():
+            self.text_var.insert("end", "\n---\n")
+        self.text_var.insert("end", text.strip())
+        self.text_var.see("end")
+        self.text_var.configure(state="disabled")
+
+    def _copy_all(self):
+        """Копирует весь текст в буфер обмена."""
+        text = self.text_var.get("1.0", "end-1c").strip()
+        if text:
+            pyperclip.copy(text)
+
+    def _clear_text(self):
+        """Очищает текстовое поле."""
+        self.text_var.configure(state="normal")
+        self.text_var.delete("1.0", "end")
+        self.text_var.configure(state="disabled")
+
 
 # ----------------------------------------------------------------------
 # Иконка в трее
@@ -1091,12 +1778,39 @@ class TrayIcon:
         self.hotkey_manager = hotkey_manager
         self.root = root
         self.paused = False
+        self.settings_window = None
+        self.audio_file_window = None
+
+        # Проверка микрофона при старте
+        if not core.audio.mic_available:
+            self.paused = True
+            self.hotkey_manager.paused = True
+            logging.warning("Микрофон не найден — программа запущена в режиме паузы")
+
         self.icon = pystray.Icon("whisper_dictation")
-        self.icon.icon = self._create_image(active=True)
-        self.icon.title = "Whisper Dictation"
+        self.icon.icon = self._create_image(active=not self.paused)
+        self.icon.title = "Whisper Dictation (Paused)" if self.paused else "Whisper Dictation"
         self._setup_menu()
         self.icon.on_click = self._on_click
-        self.settings_window = None
+
+        # Показать уведомление если нет микрофона
+        if not core.audio.mic_available:
+            self._show_toast("Микрофон не найден", "Программа в режиме паузы. Нажмите правую кнопку мыши на иконке для настроек.", duration=3)
+
+    def _show_toast(self, title, message, duration=2):
+        """Показывает всплывающее уведомление (тоаст) с автозакрытием."""
+        def _show():
+            toast = tk.Toplevel(self.root)
+            toast.title(title)
+            toast.attributes("-topmost", True)
+            toast.attributes("-toolwindow", True)
+            toast.geometry(f"350x80+{self.root.winfo_screenwidth() - 380}+{self.root.winfo_screenheight() - 120}")
+            toast.resizable(False, False)
+            toast.configure(bg="#28a745")
+            ttk.Label(toast, text=message, background="#28a745", foreground="white",
+                      font=("Segoe UI", 9)).pack(padx=10, pady=10, fill="both", expand=True)
+            self.root.after(duration * 1000, lambda: (toast.destroy()))
+        self.root.after(0, _show)
 
     def _create_image(self, active=True):
         width, height = 64, 64
@@ -1109,27 +1823,69 @@ class TrayIcon:
     def _setup_menu(self):
         menu = pystray.Menu(
             pystray.MenuItem("Пауза", self._toggle_pause),
+            pystray.MenuItem("Выбрать аудиофайл", self._on_audio_file),
             pystray.MenuItem("Настройки", self._on_settings),
             pystray.MenuItem("Выход", self._on_exit),
         )
         self.icon.menu = menu
 
+    def _on_audio_file(self, icon, item):
+        """Открывает окно для распознавания аудиофайла."""
+        if self.audio_file_window is not None:
+            try:
+                self.audio_file_window.deiconify()
+                self.audio_file_window.lift()
+                return
+            except:
+                self.audio_file_window = None
+        win_root = tk.Toplevel(self.root)
+        self.audio_file_window = win_root
+        AudioFileWindow(win_root, self.core.runner, self.root)
+        win_root.protocol("WM_DELETE_WINDOW", lambda: self._on_audio_file_close(win_root))
+
+    def _on_audio_file_close(self, window):
+        window.destroy()
+        self.audio_file_window = None
+
+    def _check_mic_and_resume(self, icon):
+        """Проверяет микрофон перед снятием паузы. Если найден — снимает с паузы."""
+        try:
+            p = pyaudio.PyAudio()
+            p.get_default_input_device_info()
+            p.terminate()
+            # Микрофон найден
+            self.paused = False
+            self.hotkey_manager.paused = False
+            icon.icon = self._create_image(active=True)
+            icon.title = "Whisper Dictation"
+            self._show_toast("Микрофон найден", "Программа готова к работе. Нажмите среднюю кнопку мыши для начала диктовки.", duration=2)
+            logging.info("Микрофон найден, пауза снята")
+        except Exception as e:
+            # Микрофон не найден — остаёмся на паузе
+            self._show_toast("Микрофон не найден", "Подключите микрофон или выберите его по умолчанию в настройках Windows.", duration=2)
+            logging.warning(f"Микрофон не найден при снятии паузы: {e}")
+
     def _toggle_pause(self, icon, item):
-        self.paused = not self.paused
-        self.hotkey_manager.paused = self.paused
-        new_icon = self._create_image(active=not self.paused)
-        icon.icon = new_icon
-        icon.title = "Whisper Dictation (Paused)" if self.paused else "Whisper Dictation"
-        logging.info(f"Пауза {'включена' if self.paused else 'выключена'}")
+        if self.paused:
+            # Пытаемся снять паузу — проверяем микрофон
+            self._check_mic_and_resume(icon)
+        else:
+            self.paused = True
+            self.hotkey_manager.paused = True
+            icon.icon = self._create_image(active=False)
+            icon.title = "Whisper Dictation (Paused)"
+            logging.info("Пауза включена")
 
     def _on_click(self, icon, pos, button, action):
         if button == pystray.Button.LEFT:
-            self.paused = not self.paused
-            self.hotkey_manager.paused = self.paused
-            new_icon = self._create_image(active=not self.paused)
-            icon.icon = new_icon
-            icon.title = "Whisper Dictation (Paused)" if self.paused else "Whisper Dictation"
-            logging.info(f"Пауза {'включена' if self.paused else 'выключена'}")
+            if self.paused:
+                self._check_mic_and_resume(icon)
+            else:
+                self.paused = True
+                self.hotkey_manager.paused = True
+                icon.icon = self._create_image(active=False)
+                icon.title = "Whisper Dictation (Paused)"
+                logging.info("Пауза включена")
 
     def _on_settings(self, icon, item):
         if self.settings_window is not None:
