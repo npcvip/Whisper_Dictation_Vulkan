@@ -1218,7 +1218,7 @@ class SettingsWindow:
         lbl.grid(row=row, column=0, sticky="w", padx=5, pady=2)
         self._set_tooltip(lbl, "Путь к исполняемому файлу whisper-cli для GPU (Vulkan)")
         self.gpu_path_var = tk.StringVar(value=self.config["Paths"]["whisper_gpu"])
-        ttk.Entry(self.tab_engine, textvariable=self.gpu_path_var, width=60).grid(row=row, column=1, padx=5)
+        ttk.Entry(self.tab_engine, textvariable=self.gpu_path_var, width=60, state="readonly").grid(row=row, column=1, padx=5)
         ttk.Button(self.tab_engine, text="Обзор", command=lambda: self._browse_file(self.gpu_path_var)).grid(row=row, column=2)
         row += 1
 
@@ -1226,7 +1226,7 @@ class SettingsWindow:
         lbl.grid(row=row, column=0, sticky="w", padx=5, pady=2)
         self._set_tooltip(lbl, "Путь к исполняемому файлу whisper-cli для CPU")
         self.cpu_path_var = tk.StringVar(value=self.config["Paths"]["whisper_cpu"])
-        ttk.Entry(self.tab_engine, textvariable=self.cpu_path_var, width=60).grid(row=row, column=1, padx=5)
+        ttk.Entry(self.tab_engine, textvariable=self.cpu_path_var, width=60, state="readonly").grid(row=row, column=1, padx=5)
         ttk.Button(self.tab_engine, text="Обзор", command=lambda: self._browse_file(self.cpu_path_var)).grid(row=row, column=2)
         row += 1
 
@@ -1234,8 +1234,8 @@ class SettingsWindow:
         lbl.grid(row=row, column=0, sticky="w", padx=5, pady=2)
         self._set_tooltip(lbl, "Путь к файлу модели Whisper (.bin)")
         self.model_path_var = tk.StringVar(value=self.config["Paths"]["model"])
-        ttk.Entry(self.tab_engine, textvariable=self.model_path_var, width=60).grid(row=row, column=1, padx=5)
-        ttk.Button(self.tab_engine, text="Обзор", command=lambda: self._browse_file(self.model_path_var)).grid(row=row, column=2)
+        ttk.Entry(self.tab_engine, textvariable=self.model_path_var, width=60, state="readonly").grid(row=row, column=1, padx=5)
+        ttk.Button(self.tab_engine, text="Обзор", command=lambda: self._browse_file(self.model_path_var, is_model=True)).grid(row=row, column=2)
         row += 1
 
         lbl = ttk.Label(self.tab_engine, text="Язык распознавания:")
@@ -1286,7 +1286,7 @@ class SettingsWindow:
         lbl.grid(row=row, column=0, sticky="w", padx=5, pady=2)
         self._set_tooltip(lbl, "Путь к исполняемому файлу whisper-server для GPU (Vulkan). Используется при выборе устройства GPU + метода транскрипции whisper-server. Модель загружается в видеопамять GPU")
         self.server_gpu_path_var = tk.StringVar(value=self.config["Paths"].get("server_gpu_path", "whisper-vulkan-Server\\whisper-server.exe"))
-        ttk.Entry(self.tab_engine, textvariable=self.server_gpu_path_var, width=60).grid(row=row, column=1, padx=5)
+        ttk.Entry(self.tab_engine, textvariable=self.server_gpu_path_var, width=60, state="readonly").grid(row=row, column=1, padx=5)
         ttk.Button(self.tab_engine, text="Обзор", command=lambda: self._browse_file(self.server_gpu_path_var)).grid(row=row, column=2)
         row += 1
 
@@ -1294,7 +1294,7 @@ class SettingsWindow:
         lbl.grid(row=row, column=0, sticky="w", padx=5, pady=2)
         self._set_tooltip(lbl, "Путь к исполняемому файлу whisper-server для CPU. Используется при выборе устройства CPU + метода транскрипции whisper-server. Модель загружается в оперативную память")
         self.server_cpu_path_var = tk.StringVar(value=self.config["Paths"].get("server_cpu_path", "whisper-CPU\\whisper-server.exe"))
-        ttk.Entry(self.tab_engine, textvariable=self.server_cpu_path_var, width=60).grid(row=row, column=1, padx=5)
+        ttk.Entry(self.tab_engine, textvariable=self.server_cpu_path_var, width=60, state="readonly").grid(row=row, column=1, padx=5)
         ttk.Button(self.tab_engine, text="Обзор", command=lambda: self._browse_file(self.server_cpu_path_var)).grid(row=row, column=2)
         row += 1
 
@@ -1706,7 +1706,7 @@ class SettingsWindow:
         """Окно 'О программе'."""
         about = tk.Toplevel(self.root)
         about.title("О программе")
-        about.geometry("400x280")
+        about.geometry("400x320")
         about.resizable(False, False)
         about.transient(self.root)
         about.grab_set()
@@ -1714,8 +1714,8 @@ class SettingsWindow:
         # Центрирование
         self.root.update_idletasks()
         x = (self.root.winfo_screenwidth() - 400) // 2
-        y = (self.root.winfo_screenheight() - 280) // 2
-        about.geometry(f"400x280+{x}+{y}")
+        y = (self.root.winfo_screenheight() - 320) // 2
+        about.geometry(f"400x320+{x}+{y}")
 
         frame = ttk.Frame(about, padding=20)
         frame.pack(fill="both", expand=True)
@@ -1758,9 +1758,73 @@ class SettingsWindow:
         label.place(relx=0.5, rely=0.5, anchor="center")
         self.root.after(500, label.destroy)
 
-    def _browse_file(self, var):
-        filename = filedialog.askopenfilename(title="Выберите исполняемый файл")
-        if filename:
+    def _browse_file(self, var, is_model=False):
+        """Открывает диалог выбора файла.
+        
+        Args:
+            var: StringVar для установки пути
+            is_model: True если выбирается модель (проверка .bin, относительный путь)
+        """
+        if is_model:
+            filetypes = [
+                ("Модели Whisper", "*.bin"),
+                ("Все файлы", "*.*"),
+            ]
+            title = "Выберите модель Whisper (.bin)"
+        else:
+            filetypes = [
+                ("Исполняемые файлы", "*.exe"),
+                ("Все файлы", "*.*"),
+            ]
+            title = "Выберите исполняемый файл"
+        
+        filename = filedialog.askopenfilename(title=title, filetypes=filetypes)
+        if not filename:
+            return
+        
+        if is_model:
+            # Проверка расширения
+            if not filename.lower().endswith('.bin'):
+                messagebox.showerror("Ошибка", "Выбранный файл не является моделью Whisper (требуется .bin).")
+                return
+            
+            # Если файл внутри RESOURCE_DIR — сохранить относительный путь
+            try:
+                abs_path = Path(filename).resolve()
+                res_dir = RESOURCE_DIR.resolve()
+                if str(abs_path).startswith(str(res_dir)):
+                    rel_path = abs_path.relative_to(res_dir)
+                    filename = str(rel_path).replace("\\", "\\\\")
+                    logging.info(f"Модель: сохранён относительный путь — {filename}")
+                else:
+                    logging.info(f"Модель: абсолютный путь (внешний файл) — {filename}")
+            except Exception as e:
+                logging.warning(f"Не удалось вычислить относительный путь: {e}")
+            
+            # Если метод = whisper-server — откат при ошибке
+            if self.method_var.get() == "whisper-server":
+                old_model = self.model_path_var.get()
+                self.model_path_var.set(filename)
+                self._save_config()
+                # Проверка: сервер запустился?
+                time.sleep(2)
+                try:
+                    r = requests.get("http://127.0.0.1:18877/health", timeout=3)
+                    if r.status_code != 200:
+                        raise ConnectionError("Сервер не отвечает")
+                except Exception as e:
+                    # Откат
+                    self.model_path_var.set(old_model)
+                    self._save_config()
+                    messagebox.showerror(
+                        "Ошибка",
+                        "Не удалось запустить сервер с выбранной моделью. Возможно, файл повреждён или не является моделью Whisper.\n\n"
+                        "Выберите правильную модель.\n\n"
+                        f"Восстановлена предыдущая модель: {old_model}"
+                    )
+                    logging.warning(f"Откат модели: {filename} → {old_model}, причина: {e}")
+                    return
+        else:
             var.set(filename)
 
     def _save_config(self):
