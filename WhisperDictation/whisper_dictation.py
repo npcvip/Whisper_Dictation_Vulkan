@@ -1,3 +1,9 @@
+# Whisper Dictation
+# Author: Anton Kuznetsov
+# GitHub: https://github.com/npcvip/Whisper_Dictation_Vulkan
+# Created: 2026
+# License: MIT
+
 import sys
 import os
 import wave
@@ -9,6 +15,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 import logging
+import webbrowser
 
 import pyaudio
 import numpy as np
@@ -154,6 +161,7 @@ DEFAULT_CONFIG = {
         "vad_min_silence_duration": "0.7",
         "vad_min_speech_duration": "0.25",
         "min_chunk_duration": "3.0",
+        "transcribe_timeout_enabled": "true",
     },
     "Audio": {
         "gain": "2.0",
@@ -328,6 +336,7 @@ class WhisperRunner:
         self._prev_method = self.method  # для отслеживания смены метода
         self._prev_device = self.config["Recognition"].get("device", "gpu")  # для отслеживания смены устройства
         self._prev_model = resolve_path(self.config["Paths"]["model"])  # для отслеживания смены модели
+        self._prev_gpu_idx = self.config["Paths"].get("gpu_device_index", "1")  # для отслеживания смены GPU
         self.update_paths()
         self._auto_start_server_if_needed()
 
@@ -499,9 +508,18 @@ class WhisperRunner:
             time.sleep(1)
             self._auto_start_server_if_needed()
 
+        # Если изменился GPU device index и метод = whisper-server — перезапуск сервера
+        new_gpu_idx = self.config["Paths"].get("gpu_device_index", "1")
+        if self.method == "whisper-server" and new_gpu_idx != self._prev_gpu_idx:
+            logging.info(f"Смена GPU device: {self._prev_gpu_idx} → {new_gpu_idx}, перезапуск сервера")
+            self._stop_server()
+            time.sleep(1)
+            self._auto_start_server_if_needed()
+
         self._prev_method = self.method
         self._prev_device = new_device
         self._prev_model = self.model_path
+        self._prev_gpu_idx = new_gpu_idx
 
     def transcribe(self, wav_path):
         if self.method == "whisper-server" and REQUESTS_AVAILABLE:
@@ -517,7 +535,8 @@ class WhisperRunner:
             try:
                 with open(wav_path, 'rb') as f:
                     files = {'file': (os.path.basename(wav_path), f, 'audio/wav')}
-                    response = requests.post(self.server_url, files=files, timeout=120)
+                    timeout_val = 600 if self.config.getboolean("Recognition", "transcribe_timeout_enabled", fallback=True) else None
+                    response = requests.post(self.server_url, files=files, timeout=timeout_val)
                 if response.status_code == 200:
                     result = response.json()
                     text = result.get('text', '').strip()
@@ -579,7 +598,7 @@ class WhisperRunner:
                 text=True,
                 encoding="utf-8",
                 check=False,
-                timeout=120,
+                timeout=600 if self.config.getboolean("Recognition", "transcribe_timeout_enabled", fallback=True) else None,
                 startupinfo=startupinfo,
                 creationflags=subprocess.CREATE_NO_WINDOW,
                 cwd=str(RECORDINGS_DIR),  # .txt создастся в RECORDINGS_DIR
@@ -1169,6 +1188,13 @@ class SettingsWindow:
         self._build_audio_tab()
         self._build_hotkeys_tab()
 
+        # Кнопка "О программе" — нижний левый угол
+        frame_about = ttk.Frame(root)
+        frame_about.pack(side="left", padx=10, pady=8)
+        self.btn_about = ttk.Button(frame_about, text="❔", width=3, command=self._show_about)
+        self.btn_about.pack()
+        self._set_tooltip(self.btn_about, "О программе")
+
     def _set_tooltip(self, widget, text):
         """Добавляет всплывающую подсказку к виджету."""
         def _on_enter(e):
@@ -1210,6 +1236,21 @@ class SettingsWindow:
         self.model_path_var = tk.StringVar(value=self.config["Paths"]["model"])
         ttk.Entry(self.tab_engine, textvariable=self.model_path_var, width=60).grid(row=row, column=1, padx=5)
         ttk.Button(self.tab_engine, text="Обзор", command=lambda: self._browse_file(self.model_path_var)).grid(row=row, column=2)
+        row += 1
+
+        lbl = ttk.Label(self.tab_engine, text="Язык распознавания:")
+        lbl.grid(row=row, column=0, sticky="w", padx=5, pady=2)
+        self._set_tooltip(lbl, "Язык распознавания речи.\n\n"
+                               "ru — русский (рекомендуется для русской речи, +5-15% точности)\n"
+                               "en — английский\n"
+                               "auto — автоопределение (если смешанные языки)\n\n"
+                               "Если говорите только по-русски (иногда вставляя английские слова)\n"
+                               "→ используйте ru. Это даст максимальное качество.\n\n"
+                               "Если аудио содержит много английского — используйте auto.\n\n"
+                               "Whisper поддерживает ~100 языков. Для повышения качества\n"
+                               "укажите нужный язык (см. офф. документацию Whisper для кодов).")
+        self.language_var = tk.StringVar(value=self.config["Recognition"]["language"])
+        ttk.Entry(self.tab_engine, textvariable=self.language_var, width=10).grid(row=row, column=1, sticky="w", padx=5)
         row += 1
 
         lbl = ttk.Label(self.tab_engine, text="Индекс GPU (--device):")
@@ -1268,6 +1309,7 @@ class SettingsWindow:
         self.device_var.trace_add("write", lambda *a: self._save_config())
         self.method_var.trace_add("write", lambda *a: self._save_config())
         self.server_url_var.trace_add("write", lambda *a: self._save_config())
+        self.language_var.trace_add("write", lambda *a: self._save_config())
 
     def _build_audio_tab(self):
         lbl = ttk.Label(self.tab_audio, text="Режим работы:")
@@ -1660,6 +1702,44 @@ class SettingsWindow:
         """
         self._save_config()
 
+    def _show_about(self):
+        """Окно 'О программе'."""
+        about = tk.Toplevel(self.root)
+        about.title("О программе")
+        about.geometry("400x280")
+        about.resizable(False, False)
+        about.transient(self.root)
+        about.grab_set()
+
+        # Центрирование
+        self.root.update_idletasks()
+        x = (self.root.winfo_screenwidth() - 400) // 2
+        y = (self.root.winfo_screenheight() - 280) // 2
+        about.geometry(f"400x280+{x}+{y}")
+
+        frame = ttk.Frame(about, padding=20)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(frame, text="Whisper Dictation", font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(0, 5))
+        ttk.Label(frame, text="Author: Anton Kuznetsov", font=("Segoe UI", 10)).pack(anchor="w", pady=2)
+        ttk.Label(frame, text="Created: 2026", font=("Segoe UI", 9)).pack(anchor="w", pady=2)
+        ttk.Label(frame, text="License: MIT", font=("Segoe UI", 9)).pack(anchor="w", pady=2)
+
+        # Ссылка на GitHub (кликабельная)
+        github_url = "https://github.com/npcvip/Whisper_Dictation_Vulkan"
+        lbl_github = ttk.Label(frame, text=github_url, font=("Segoe UI", 9), foreground="blue", cursor="hand2")
+        lbl_github.pack(anchor="w", pady=(10, 0))
+        lbl_github.bind("<Button-1>", lambda e: webbrowser.open(github_url))
+
+        # Кнопка README
+        readme_path = RESOURCE_DIR / "README.md"
+        if readme_path.exists():
+            btn_readme = ttk.Button(frame, text="README", command=lambda: webbrowser.open("file:///" + str(readme_path)))
+            btn_readme.pack(pady=(15, 5))
+            self._set_tooltip(btn_readme, "Открыть README.md в браузере")
+
+        ttk.Button(frame, text="Закрыть", command=about.destroy).pack(pady=(10, 0))
+
     def _show_temp_notification(self, text):
         """Показывает временное уведомление, которое исчезает через 0.5 сек."""
         label = tk.Label(
@@ -1706,6 +1786,7 @@ class SettingsWindow:
                 ("Recognition", "vad_min_silence_duration", lambda: str(self.vad_silence_var.get())),
                 ("Recognition", "vad_min_speech_duration", lambda: str(self.min_speech_frames_var.get())),
                 ("Recognition", "min_chunk_duration", lambda: str(self.vad_chunk_duration_var.get())),
+                ("Recognition", "language", lambda: self.language_var.get().strip()),
                 ("Hotkeys", "hotkey", lambda: self.hotkey_var.get().strip()),
             ]
             for section, key, getter in settings_map:
@@ -1796,10 +1877,11 @@ class AudioFileWindow:
     - Прослушивание обработанного файла
     """
 
-    def __init__(self, root, runner, parent_root):
+    def __init__(self, root, runner, parent_root, config):
         self.root = root
         self.runner = runner
         self.parent_root = parent_root
+        self.config = config
         self.root.title("Whisper Dictation — Распознавание аудиофайла")
         self.root.geometry("650x550")
         self.root.resizable(True, True)
@@ -1824,16 +1906,16 @@ class AudioFileWindow:
         self._set_tooltip(chk_rumble, "High-pass фильтр — убирает низкие частоты (гул, рокот, шум кондиционера).\n\n"
                                        "Чем меньше частота — тем больше низких частот останется\n"
                                        "Чем больше частота — тем больше низких частот будет убрано\n\n"
-                                       "Рекомендуется: 80 Гц")
-        self.rumble_freq_var = tk.IntVar(value=80)
+                                       "Рекомендуется: 100 Гц")
+        self.rumble_freq_var = tk.IntVar(value=100)
         scale_rumble = ttk.Scale(frame_noise, from_=40, to=200, variable=self.rumble_freq_var,
                   orient="horizontal", command=lambda v: self._update_rumble_label())
         scale_rumble.grid(row=0, column=1, sticky="we", padx=5)
         self._set_tooltip(scale_rumble, "Частота high-pass фильтра (40-200 Гц).\n\n"
                                        "40 Гц — только очень низкие частоты\n"
-                                       "80 Гц — рекомендуемое значение\n"
+                                       "100 Гц — рекомендуемое значение\n"
                                        "200 Гц — убирает много низких частот, голос может стать тонким")
-        self.rumble_label_var = tk.StringVar(value="80 Гц")
+        self.rumble_label_var = tk.StringVar(value="100 Гц")
         ttk.Label(frame_noise, textvariable=self.rumble_label_var, foreground="gray",
                   font=("Segoe UI", 7)).grid(row=0, column=2, sticky="w", padx=2)
 
@@ -1844,16 +1926,16 @@ class AudioFileWindow:
         self._set_tooltip(chk_hiss, "Low-pass фильтр — убирает высокие частоты (шипение, фон, свист).\n\n"
                                      "Чем меньше частота — тем больше высоких частот будет убрано\n"
                                      "Чем больше частота — тем больше высоких частот останется\n\n"
-                                     "Рекомендуется: 8000 Гц")
-        self.hiss_freq_var = tk.IntVar(value=8000)
+                                     "Рекомендуется: 11000 Гц")
+        self.hiss_freq_var = tk.IntVar(value=11000)
         scale_hiss = ttk.Scale(frame_noise, from_=4000, to=16000, variable=self.hiss_freq_var,
                   orient="horizontal", command=lambda v: self._update_hiss_label())
         scale_hiss.grid(row=1, column=1, sticky="we", padx=5)
         self._set_tooltip(scale_hiss, "Частота low-pass фильтра (4000-16000 Гц).\n\n"
                                        "4000 Гц — убирает много высоких частот, голос может стать глухим\n"
-                                       "8000 Гц — рекомендуемое значение\n"
+                                       "11000 Гц — рекомендуемое значение\n"
                                        "16000 Гц — оставляет почти все высокие частоты")
-        self.hiss_label_var = tk.StringVar(value="8000 Гц")
+        self.hiss_label_var = tk.StringVar(value="11000 Гц")
         ttk.Label(frame_noise, textvariable=self.hiss_label_var, foreground="gray",
                   font=("Segoe UI", 7)).grid(row=1, column=2, sticky="w", padx=2)
 
@@ -1887,12 +1969,26 @@ class AudioFileWindow:
         self.text_var.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
 
-        # Row 4: кнопки внизу
+        # Row 4: кнопки внизу + Toggle Timeout
         frame_bottom = ttk.Frame(root, padding=10)
         frame_bottom.grid(row=4, column=0, sticky="ew")
 
         ttk.Button(frame_bottom, text="Скопировать всё", command=self._copy_all).grid(row=0, column=0, padx=5)
         ttk.Button(frame_bottom, text="Очистить", command=self._clear_text).grid(row=0, column=1, padx=5)
+
+        # Toggle Timeout кнопка
+        self.timeout_enabled = self.config.getboolean("Recognition", "transcribe_timeout_enabled", fallback=True)
+        self.btn_timeout = ttk.Button(
+            frame_bottom,
+            text="Таймаут: ВКЛ (10 мин)",
+            command=self._toggle_timeout,
+        )
+        self.btn_timeout.grid(row=0, column=2, sticky="e", padx=5)
+        self._set_tooltip(self.btn_timeout, "Таймаут защиты от зависания (10 мин).\n\n"
+                                             "Если whisper-cli зависнет (длинный файл, мало памяти),\n"
+                                             "транскрипция будет прервана через 10 минут.\n\n"
+                                             "Для длинных или сложных файлов рекомендуется отключить.")
+        self._update_timeout_button()
 
         # Настройка весов
         root.grid_rowconfigure(3, weight=1)
@@ -2038,6 +2134,22 @@ class AudioFileWindow:
         self.text_var.delete("1.0", "end")
         self.text_var.configure(state="disabled")
 
+    def _toggle_timeout(self):
+        """Переключает таймаут транскрипции (ВКЛ/ВЫКЛ)."""
+        self.timeout_enabled = not self.timeout_enabled
+        # Сохраняем в конфиг
+        self.config["Recognition"]["transcribe_timeout_enabled"] = str(self.timeout_enabled).lower()
+        save_config(self.config)
+        self._update_timeout_button()
+        logging.info(f"Таймаут транскрипции: {'ВКЛ' if self.timeout_enabled else 'ВЫКЛ'}")
+
+    def _update_timeout_button(self):
+        """Обновляет текст кнопки таймаута."""
+        if self.timeout_enabled:
+            self.btn_timeout.configure(text="Таймаут: ВКЛ (10 мин)")
+        else:
+            self.btn_timeout.configure(text="Таймаут: ВЫКЛ")
+
 
 # ----------------------------------------------------------------------
 # Иконка в трее
@@ -2111,7 +2223,7 @@ class TrayIcon:
                 self.audio_file_window = None
         win_root = tk.Toplevel(self.root)
         self.audio_file_window = win_root
-        AudioFileWindow(win_root, self.core.runner, self.root)
+        AudioFileWindow(win_root, self.core.runner, self.root, self.config)
         win_root.protocol("WM_DELETE_WINDOW", lambda: self._on_audio_file_close(win_root))
 
     def _on_audio_file_close(self, window):
