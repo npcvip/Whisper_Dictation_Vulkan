@@ -12,6 +12,7 @@ import configparser
 import subprocess
 import threading
 import time
+import ctypes
 from datetime import datetime
 from pathlib import Path
 import logging
@@ -153,10 +154,10 @@ DEFAULT_CONFIG = {
         "device": "gpu",
         "mode": "record_then_analyze",
         "language": "ru",
-        "method": "whisper-server",   # "whisper-cli" или "whisper-server"
+        "method": "whisper-cli",   # "whisper-cli" или "whisper-server"
         "server_url": "http://127.0.0.1:18877/inference",
-        "use_vad": "false",
-        "use_vad_streaming": "true",
+        "use_vad": "true",
+        "use_vad_streaming": "false",
         "vad_threshold": "0.5",
         "vad_min_silence_duration": "0.7",
         "vad_min_speech_duration": "0.25",
@@ -169,6 +170,7 @@ DEFAULT_CONFIG = {
     },
     "Hotkeys": {
         "hotkey": "middle_mouse",
+        "hold_mode": "true",
     },
 }
 
@@ -1003,7 +1005,11 @@ class DictationCore:
         preview = text[:50].replace('\n', ' ')
         ts = time.strftime("%H:%M:%S")
         logging.info(f"[{ts}] Вставка текста [{mode_label}]: '{preview}...' (длина {len(text)})")
-        
+
+        # Восстановление фокуса перед вставкой (belt-and-suspenders)
+        if hasattr(self, '_hotkey_mgr') and self._hotkey_mgr:
+            self._hotkey_mgr._restore_focus()
+
         if streaming:
             # Стриминг — асинхронные потоки, нужна блокировка буфера обмена
             with clipboard_lock:
@@ -1060,6 +1066,7 @@ class HotkeyManager:
         self.core = core
         self.config = config
         self.hotkey_str = config["Hotkeys"]["hotkey"]
+        self.hold_mode = config.getboolean("Hotkeys", "hold_mode", fallback=True)
         self.listener_mouse = None
         self.listener_keyboard = None
         self.is_recording = False
@@ -1069,9 +1076,98 @@ class HotkeyManager:
         self.paused = False
         self.parse_hotkey()
         self.running = False
+        # Для постоянного уведомления о записи (создаётся лениво при первом показе)
+        self._recording_toast = None
+        # Для сохранения/восстановления фокуса
+        self._saved_foreground_hwnd = None
+        # Для задержки перед стартом записи в HOLD режиме
+        self._hold_start_time = None
+        self._hold_timer = None
+        self._hold_pending = False
+        self.HOLD_DELAY = 0.3  # 300 мс — минимальное время удержания для записи
+
+    def _ensure_recording_toast(self):
+        """Создаёт окно уведомления при первом показе (ленивая инициализация)."""
+        if self._recording_toast is not None:
+            return
+        try:
+            if hasattr(self.core, '_tray') and self.core._tray:
+                toast = tk.Toplevel(self.core._tray.root)
+                toast.withdraw()  # скрыто до показа
+                toast.title("Идёт запись")
+                toast.attributes("-topmost", True)
+                toast.attributes("-toolwindow", True)
+                toast.geometry(f"350x80+{self.core._tray.root.winfo_screenwidth() - 380}+{self.core._tray.root.winfo_screenheight() - 120}")
+                toast.resizable(False, False)
+                toast.configure(bg="#90ee90")
+                ttk.Label(toast, text="Идёт запись...", background="#90ee90", foreground="#1a1a1a",
+                          font=("Segoe UI", 9, "bold")).pack(padx=10, pady=10, fill="both", expand=True)
+                # Windows API: установить WS_EX_NOACTIVATE — окно видно, но никогда не получает фокус
+                try:
+                    GWL_EXSTYLE = -20
+                    WS_EX_NOACTIVATE = 0x00000080
+                    WS_EX_TOOLWINDOW = 0x00000080
+                    toast.update_idletasks()  # чтобы hwnd был создан
+                    hwnd = toast.winfo_id()
+                    old_style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+                    ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, old_style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
+                    logging.debug(f"WS_EX_NOACTIVATE установлен для окна уведомления")
+                except Exception as e:
+                    logging.debug(f"SetWindowLong failed: {e}")
+                # При ручном закрытии (X) — скрывать, а не уничтожать
+                toast.protocol("WM_DELETE_WINDOW", lambda: toast.withdraw())
+                self._recording_toast = toast
+        except Exception as e:
+            logging.debug(f"Не удалось создать окно уведомления: {e}")
+
+    def _show_recording_indicator(self):
+        """Показывает постоянное уведомление "Идёт запись..." пока идёт запись."""
+        if not self.config.getboolean("Hotkeys", "recording_notify", fallback=True):
+            return
+        # Сохраняем текущее активное окно для восстановления фокуса
+        try:
+            self._saved_foreground_hwnd = ctypes.windll.user32.GetForegroundWindow()
+        except Exception:
+            self._saved_foreground_hwnd = None
+        self._ensure_recording_toast()
+        if self._recording_toast is not None:
+            toast = self._recording_toast
+            toast.after(0, lambda: toast.deiconify())
+
+    def _restore_focus(self):
+        """Восстанавливает фокус на сохранённом окне."""
+        if self._saved_foreground_hwnd is not None:
+            try:
+                ctypes.windll.user32.SetForegroundWindow(self._saved_foreground_hwnd)
+                self._saved_foreground_hwnd = None
+            except Exception:
+                pass
+
+    def _hide_recording_indicator(self):
+        """Скрывает уведомление о записи и восстанавливает фокус."""
+        # Сначала восстанавливаем фокус
+        self._restore_focus()
+        if self._recording_toast is not None:
+            toast = self._recording_toast
+            toast.after(0, lambda: toast.withdraw())
+
+    def _hold_timer_callback(self):
+        """Вызывается через HOLD_DELAY если клавиша всё ещё удерживается — старт записи."""
+        # Проверяем: клавиша всё ещё нажата?
+        if self.target_combo and self.target_combo.issubset(self.pressed_keys):
+            self.is_recording = True
+            self._hold_pending = False
+            self.core.start_recording()
+            self._show_recording_indicator()
+            logging.debug("HOLD: таймер сработал, запись начата")
+        else:
+            # Клавиша отпущена до срабатывания таймера — отменяем
+            self._hold_pending = False
+            logging.debug("HOLD: таймер сработал, но клавиша уже отпущена, запись не начата")
 
     def parse_hotkey(self):
         self.hotkey_str = self.config["Hotkeys"]["hotkey"].strip().lower()
+        self.hold_mode = self.config.getboolean("Hotkeys", "hold_mode", fallback=True)
         if self.hotkey_str == "middle_mouse":
             self.use_mouse = True
             self.target_combo = None
@@ -1081,16 +1177,20 @@ class HotkeyManager:
             combo = set()
             for part in parts:
                 part = part.strip()
-                if part == "ctrl":
+                # Нормализуем: ctrl_l → ctrl, shift_r → shift
+                if part.startswith("ctrl"):
                     combo.add(Key.ctrl)
-                elif part == "shift":
+                elif part.startswith("shift"):
                     combo.add(Key.shift)
-                elif part == "alt":
+                elif part.startswith("alt"):
                     combo.add(Key.alt)
+                elif part.startswith("f") and len(part) <= 3 and part[1:].isdigit() and 1 <= int(part[1:]) <= 12:
+                    # F-клавиши: f1-f12 → Key.f1-Key.f12
+                    combo.add(getattr(Key, part))
                 else:
                     combo.add(KeyCode.from_char(part))
             self.target_combo = combo
-        logging.info(f"Горячая клавиша: {self.hotkey_str}")
+        logging.info(f"Горячая клавиша: {self.hotkey_str}, hold_mode: {self.hold_mode}")
 
     def toggle_pause(self):
         self.paused = not self.paused
@@ -1129,34 +1229,120 @@ class HotkeyManager:
         self.parse_hotkey()
         self.start_listeners()
 
+
     def _on_mouse_click(self, x, y, button, pressed):
         if self.paused or not self.core.is_running:
             return
         if button == Button.middle:
-            if pressed and not self.is_recording:
-                self.is_recording = True
-                self.core.start_recording()
-            elif not pressed and self.is_recording:
-                self.is_recording = False
-                self.core.stop_recording()
+            # Защита от дребезга — ТОЛЬКО для нажатия (pressed=True), не для отпускания!
+            if pressed:
+                current_time = time.time()
+                if hasattr(self, '_last_click_time'):
+                    if current_time - self._last_click_time < 0.3:
+                        logging.debug(f"Mouse debounce: ignored (delta={current_time - self._last_click_time:.3f}s)")
+                        return
+                self._last_click_time = current_time
+
+            if self.hold_mode:
+                # HOLD: нажали-держим = запись, отпустили = стоп
+                if pressed and not self.is_recording:
+                    self.is_recording = True
+                    self.core.start_recording()
+                    self._show_recording_indicator()
+                elif not pressed and self.is_recording:
+                    self.is_recording = False
+                    self.core.stop_recording()
+                    self._hide_recording_indicator()
+            else:
+                # TOGGLE: нажали = старт, нажали ещё раз = стоп
+                if pressed:
+                    if self.is_recording:
+                        self.is_recording = False
+                        self.core.stop_recording()
+                        self._hide_recording_indicator()
+                    else:
+                        self.is_recording = True
+                        self.core.start_recording()
+                        self._show_recording_indicator()
 
     def _on_key_press(self, key):
         if self.paused or not self.core.is_running:
             return
-        self.pressed_keys.add(key)
-        if self.target_combo and self.target_combo.issubset(self.pressed_keys):
-            if not self.is_recording:
-                self.is_recording = True
-                self.core.start_recording()
+        # Защита: если target_combo пустой — не запускать запись на любую клавишу
+        if self.use_mouse or not self.target_combo or len(self.target_combo) == 0:
+            return
+        # Нормализация: ctrl_l → ctrl, shift_l → shift, alt_l → alt
+        normalized = key
+        if hasattr(key, 'name'):
+            name = key.name
+            if name.startswith("ctrl"):
+                normalized = Key.ctrl
+            elif name.startswith("shift"):
+                normalized = Key.shift
+            elif name.startswith("alt"):
+                normalized = Key.alt
+        self.pressed_keys.add(normalized)
+
+        if self.target_combo.issubset(self.pressed_keys):
+            if self.hold_mode:
+                # HOLD: нажали-держим = запись (с задержкой HOLD_DELAY для защиты от случайных нажатий)
+                if not self.is_recording and not self._hold_pending:
+                    self._hold_start_time = time.time()
+                    self._hold_pending = True
+                    # Запускаем таймер: если клавиша будет удерживаться HOLD_DELAY секунд → старт записи
+                    self._hold_timer = threading.Timer(self.HOLD_DELAY, self._hold_timer_callback)
+                    self._hold_timer.start()
+            else:
+                # TOGGLE: только точное совпадение горячей клавиши
+                # Проверяем: нажаты ТОЛЬКО клавиши из target_combo (без лишних)
+                if self.pressed_keys == self.target_combo:
+                    if self.is_recording:
+                        self.is_recording = False
+                        self.core.stop_recording()
+                        self._hide_recording_indicator()
+                    else:
+                        self.is_recording = True
+                        self.core.start_recording()
+                        self._show_recording_indicator()
 
     def _on_key_release(self, key):
         if self.paused or not self.core.is_running:
             return
-        if key in self.pressed_keys:
-            self.pressed_keys.remove(key)
-        if self.is_recording and self.target_combo and not self.target_combo.issubset(self.pressed_keys):
-            self.is_recording = False
-            self.core.stop_recording()
+        # Защита: если target_combo пустой — не запускать запись на любую клавишу
+        if self.use_mouse or not self.target_combo or len(self.target_combo) == 0:
+            return
+        # Нормализация: ctrl_l → ctrl, shift_l → shift, alt_l → alt
+        normalized = key
+        if hasattr(key, 'name'):
+            name = key.name
+            if name.startswith("ctrl"):
+                normalized = Key.ctrl
+            elif name.startswith("shift"):
+                normalized = Key.shift
+            elif name.startswith("alt"):
+                normalized = Key.alt
+        if normalized in self.pressed_keys:
+            self.pressed_keys.remove(normalized)
+
+        # Отмена задержки HOLD: отпустили раньше чем HOLD_DELAY → ничего не делаем
+        if self.hold_mode and self._hold_pending and not self.is_recording:
+            if not self.target_combo.issubset(self.pressed_keys):
+                if self._hold_timer is not None:
+                    self._hold_timer.cancel()
+                    self._hold_timer = None
+                self._hold_pending = False
+                self._hold_start_time = None
+                logging.debug("HOLD: отпущено раньше HOLD_DELAY, запись не начата")
+
+        # HOLD режим: отпустили = стоп
+        if self.hold_mode and self.is_recording:
+            # Проверяем: если отпущена горячая клавиша (комбинация больше не собрана)
+            if not self.target_combo.issubset(self.pressed_keys):
+                self.is_recording = False
+                self.core.stop_recording()
+                self._hide_recording_indicator()
+                self._hold_pending = False
+                self._hold_start_time = None
 
 # ----------------------------------------------------------------------
 # Окно настроек
@@ -1171,8 +1357,10 @@ class SettingsWindow:
         self.root.resizable(True, True)
         self.root.geometry("850x550")
 
-        # Создаём hotkey_var ДО вызова _build_*_tab() чтобы _save_config() мог его использовать
+        # Создаём hotkey_var, hold_mode_var, recording_notify_var ДО вызова _build_*_tab() чтобы _save_config() мог их использовать
         self.hotkey_var = tk.StringVar(value=self.config["Hotkeys"]["hotkey"])
+        self.hold_mode_var = tk.BooleanVar(value=self.config.getboolean("Hotkeys", "hold_mode", fallback=True))
+        self.recording_notify_var = tk.BooleanVar(value=self.config.getboolean("Hotkeys", "recording_notify", fallback=True))
 
         notebook = ttk.Notebook(root)
         notebook.pack(fill="both", expand=True, padx=10, pady=10)
@@ -1188,11 +1376,14 @@ class SettingsWindow:
         self._build_audio_tab()
         self._build_hotkeys_tab()
 
-        # Кнопка "О программе" — нижний левый угол
+        # Кнопки "Логи" и "О программе" — нижний левый угол
         frame_about = ttk.Frame(root)
         frame_about.pack(side="left", padx=10, pady=8)
+        self.btn_logs = ttk.Button(frame_about, text="📄", width=3, command=self._open_logs_dir)
+        self.btn_logs.pack(side="left", padx=(0, 2))
+        self._set_tooltip(self.btn_logs, "Открыть папку логов и записей")
         self.btn_about = ttk.Button(frame_about, text="❔", width=3, command=self._show_about)
-        self.btn_about.pack()
+        self.btn_about.pack(side="left")
         self._set_tooltip(self.btn_about, "О программе")
 
     def _set_tooltip(self, widget, text):
@@ -1509,23 +1700,46 @@ class SettingsWindow:
             return "Не удалось получить"
 
     def _build_hotkeys_tab(self):
+        # Описание логики работы
+        lbl_info = ttk.Label(self.tab_hotkeys, 
+            text="Работает только выбранная кнопка. По умолчанию — средняя кнопка мыши.\n"
+                 "Можно назначить любую клавишу (рекомендуется F9 — самая свободная в Windows).",
+            font=("Segoe UI", 8), foreground="gray")
+        lbl_info.grid(row=0, column=0, columnspan=3, sticky="w", padx=5, pady=(5, 5))
+
+        # Checkbox: Hold режим
+        self.hold_mode_var = tk.BooleanVar(value=self.config.getboolean("Hotkeys", "hold_mode", fallback=True))
+        chk_hold = ttk.Checkbutton(self.tab_hotkeys, text="Удерживать для записи", variable=self.hold_mode_var)
+        chk_hold.grid(row=1, column=0, columnspan=3, sticky="w", padx=5, pady=2)
+        self._set_tooltip(chk_hold, 
+            "Удерживать (Hold включено): нажали и держите выбранную кнопку — идёт запись, отпустили — стоп.\n\n"
+            "Переключение (Hold выключено): нажали — запись началась, нажали ещё раз — запись остановлена.")
+
         lbl = ttk.Label(self.tab_hotkeys, text="Горячая клавиша:")
-        lbl.grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        self._set_tooltip(lbl, "Клавиша или комбинация для начала/остановки записи. Нажатие=старт, отпускание=стоп+распознавание")
-        self.hotkey_entry = ttk.Entry(self.tab_hotkeys, textvariable=self.hotkey_var, width=20)
-        self.hotkey_entry.grid(row=0, column=1, sticky="w", padx=5)
-        ttk.Button(self.tab_hotkeys, text="Запомнить", command=self._capture_hotkey).grid(row=0, column=2, padx=5)
+        lbl.grid(row=2, column=0, sticky="w", padx=5, pady=2)
+        self._set_tooltip(lbl, "Клавиша или комбинация для начала/остановки записи")
+        self.hotkey_entry = ttk.Entry(self.tab_hotkeys, textvariable=self.hotkey_var, width=20, state="readonly")
+        self.hotkey_entry.grid(row=2, column=1, sticky="w", padx=5)
+        ttk.Button(self.tab_hotkeys, text="Настроить", command=self._capture_hotkey).grid(row=2, column=2, padx=5)
         ttk.Button(self.tab_hotkeys, text="Сбросить на среднюю кнопку мыши",
-                   command=lambda: self.hotkey_var.set("middle_mouse")).grid(row=1, column=1, sticky="w", padx=5, pady=5)
+                   command=lambda: self.hotkey_var.set("middle_mouse")).grid(row=3, column=1, sticky="w", padx=5, pady=5)
+
+        # Checkbox: уведомление о записи
+        self.recording_notify_var = tk.BooleanVar(value=self.config.getboolean("Hotkeys", "recording_notify", fallback=True))
+        chk_notify = ttk.Checkbutton(self.tab_hotkeys, text="Уведомления о записи", variable=self.recording_notify_var)
+        chk_notify.grid(row=4, column=0, columnspan=3, sticky="w", padx=5, pady=5)
+        self._set_tooltip(chk_notify, "Показывать салатовое уведомление «Идёт запись...» во время записи. Уведомление исчезает при остановке записи")
 
         self.hotkey_var.trace_add("write", lambda *a: self._save_config())
+        self.hold_mode_var.trace_add("write", lambda *a: self._save_config())
+        self.recording_notify_var.trace_add("write", lambda *a: self._save_config())
 
     def _capture_hotkey(self):
         top = tk.Toplevel(self.root)
         top.title("Нажмите комбинацию...")
         top.grab_set()
-        label = ttk.Label(top, text="Нажмите нужную комбинацию клавиш")
-        label.pack(padx=20, pady=20)
+        label = ttk.Label(top, text="Нажмите нужную комбинацию клавиш", font=("Segoe UI", 10))
+        label.pack(padx=20, pady=15)
         captured = []
 
         def on_press(key):
@@ -1533,17 +1747,31 @@ class SettingsWindow:
                 captured.clear()
                 top.destroy()
                 return
+            # Нормализация: для Key (ctrl, shift, alt) используем name
+            # Для KeyCode используем vk → буква (независимо от модификаторов)
             try:
-                k = key.char
-            except AttributeError:
+                # Это Key (ctrl, shift, alt и т.д.)
                 k = key.name
+            except AttributeError:
+                # Это KeyCode — получаем букву из vk (виртуальный код)
+                # vk=90 → 'Z' → 'z', что работает независимо от Ctrl/Shift
+                if key.vk is not None:
+                    k = chr(key.vk).lower()
+                elif key.char is not None and key.char.isprintable():
+                    k = key.char.lower()
+                else:
+                    return
             if k not in captured:
                 captured.append(k)
 
         def on_release(key):
             if captured:
                 combo = "+".join(captured)
-                self.hotkey_var.set(combo)
+                # Запрос подтверждения
+                listener.stop()
+                result = messagebox.askyesno("Подтверждение", f"Вы выбрали: {combo}\n\nПодтвердить?")
+                if result:
+                    self.hotkey_var.set(combo)
                 top.destroy()
 
         listener = KBListener(on_press=on_press, on_release=on_release)
@@ -1702,6 +1930,16 @@ class SettingsWindow:
         """
         self._save_config()
 
+    def _open_logs_dir(self):
+        """Открывает папку DATA_DIR в проводнике (логи, записи, конфиг)."""
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            os.startfile(str(DATA_DIR))
+            logging.info(f"Открыта папка: {DATA_DIR}")
+        except Exception as e:
+            logging.error(f"Не удалось открыть папку {DATA_DIR}: {e}")
+            messagebox.showerror("Ошибка", f"Не удалось открыть папку:\n\n{DATA_DIR}")
+
     def _show_about(self):
         """Окно 'О программе'."""
         about = tk.Toplevel(self.root)
@@ -1852,6 +2090,8 @@ class SettingsWindow:
                 ("Recognition", "min_chunk_duration", lambda: str(self.vad_chunk_duration_var.get())),
                 ("Recognition", "language", lambda: self.language_var.get().strip()),
                 ("Hotkeys", "hotkey", lambda: self.hotkey_var.get().strip()),
+                ("Hotkeys", "hold_mode", lambda: str(self.hold_mode_var.get()).lower()),
+                ("Hotkeys", "recording_notify", lambda: str(self.recording_notify_var.get()).lower()),
             ]
             for section, key, getter in settings_map:
                 new_val = getter() if callable(getter) else getter.get()
@@ -2244,7 +2484,7 @@ class TrayIcon:
         if not core.audio.mic_available:
             self._show_toast("Микрофон не найден", "Программа в режиме паузы. Нажмите правую кнопку мыши на иконке для настроек.", duration=3)
 
-    def _show_toast(self, title, message, duration=2):
+    def _show_toast(self, title, message, duration=0.5):
         """Показывает всплывающее уведомление (тоаст) с автозакрытием."""
         def _show():
             toast = tk.Toplevel(self.root)
@@ -2256,7 +2496,8 @@ class TrayIcon:
             toast.configure(bg="#28a745")
             ttk.Label(toast, text=message, background="#28a745", foreground="white",
                       font=("Segoe UI", 9)).pack(padx=10, pady=10, fill="both", expand=True)
-            self.root.after(duration * 1000, lambda: (toast.destroy()))
+            # Используем отдельный поток для закрытия — работает из любого потока (трей, хоткей)
+            threading.Thread(target=lambda: (time.sleep(duration), toast.destroy()), daemon=True).start()
         self.root.after(0, _show)
 
     def _create_image(self, active=True):
@@ -2344,12 +2585,16 @@ class TrayIcon:
                 self.settings_window = None
         settings_root = tk.Toplevel(self.root)
         self.settings_window = settings_root
-        SettingsWindow(settings_root, self.config, self.core, self.hotkey_manager)
+        sw = SettingsWindow(settings_root, self.config, self.core, self.hotkey_manager)
+        # Сохраняем экземпляр SettingsWindow на core для уведомлений
+        self.core._settings_window = sw
         settings_root.protocol("WM_DELETE_WINDOW", lambda: self._on_settings_close(settings_root))
 
     def _on_settings_close(self, window):
         window.destroy()
         self.settings_window = None
+        # Очищаем ссылку на SettingsWindow
+        self.core._settings_window = None
 
     def _on_exit(self, icon, item):
         logging.info("Выход из программы")
@@ -2482,6 +2727,9 @@ def main():
     root.withdraw()
 
     tray = TrayIcon(core, config, hotkey_manager, root)
+    # Сохраняем ссылки для уведомлений и восстановления фокуса
+    core._tray = tray
+    core._hotkey_mgr = hotkey_manager
     tray_thread = threading.Thread(target=tray.run, daemon=True)
     tray_thread.start()
 
