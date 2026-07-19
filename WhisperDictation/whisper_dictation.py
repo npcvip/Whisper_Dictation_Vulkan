@@ -154,7 +154,7 @@ DEFAULT_CONFIG = {
         "device": "gpu",
         "mode": "record_then_analyze",
         "language": "ru",
-        "method": "whisper-cli",   # "whisper-cli" или "whisper-server"
+        "method": "whisper-server",   # "whisper-cli" или "whisper-server"
         "server_url": "http://127.0.0.1:18877/inference",
         "use_vad": "true",
         "use_vad_streaming": "false",
@@ -2645,6 +2645,7 @@ class TrayIcon:
         logging.info("Выход из программы")
         self.hotkey_manager.stop_listeners()
         self.core.shutdown()
+        _release_lock()
         self.root.quit()
         icon.stop()
         def force_exit():
@@ -2786,25 +2787,69 @@ def _ensure_model_available(config, root):
     logging.info(f"Модель выбрана пользователем: {file_path}")
 
 # ----------------------------------------------------------------------
-# Защита от запуска второй копии
+# Защита от запуска второй копии (файловый лок с проверкой PID)
 # ----------------------------------------------------------------------
-def _ensure_single_instance():
-    """Проверяет, не запущена ли уже копия программы (через named mutex)."""
+LOCK_FILE = DATA_DIR / ".whisper_dictation_lock"
+
+def _is_process_alive(pid):
+    """Проверяет, жив ли процесс с указанным PID (Windows через tasklist)."""
     try:
-        import win32event
-        import win32api
-        MUTEX_NAME = "Global\\WhisperDictation_Mutex"
-        mutex = win32event.CreateMutex(None, False, MUTEX_NAME)
-        if win32api.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
-            return False
-        return True
-    except ImportError:
-        # Если pywin32 не установлен — пропускаем проверку
-        logging.warning("pywin32 не установлен, проверка единственного экземпляра отключена")
-        return True
+        result = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            capture_output=True, encoding="cp1251", errors="replace", timeout=5
+        )
+        # tasklist выводит строку с PID, если процесс найден
+        # Формат: whisper_dictation.exe    12345 Console    1    50000 K
+        # PID — второе поле при разбиении по пробелам
+        for line in result.stdout.strip().splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == str(pid):
+                return True
+        return False
+    except Exception:
+        return False
+
+def _ensure_single_instance():
+    """Проверяет, не запущена ли уже копия программы (через файловый лок + PID)."""
+    current_pid = os.getpid()
+
+    if LOCK_FILE.exists():
+        try:
+            with open(LOCK_FILE, "r") as f:
+                other_pid = int(f.read().strip())
+            if _is_process_alive(other_pid):
+                # Другой экземпляр жив — выходим
+                return False
+            else:
+                # Старый экземпляр мёртв — удаляем лок
+                logging.info(f"Удалён старый файл-лок (PID {other_pid} мёртв)")
+                LOCK_FILE.unlink()
+        except (ValueError, OSError) as e:
+            # Невалидный файл — удаляем
+            logging.warning(f"Невалидный файл-лок: {e}, удаляю")
+            try:
+                LOCK_FILE.unlink()
+            except:
+                pass
+
+    # Создаём файл-лок с нашим PID
+    try:
+        with open(LOCK_FILE, "w") as f:
+            f.write(str(current_pid))
+        logging.info(f"Файл-лок создан (PID {current_pid})")
     except Exception as e:
-        logging.warning(f"Ошибка при проверке экземпляра: {e}")
-        return True
+        logging.warning(f"Не удалось создать файл-лок: {e}")
+
+    return True
+
+def _release_lock():
+    """Удаляет файл-лок при выходе из программы."""
+    try:
+        if LOCK_FILE.exists():
+            LOCK_FILE.unlink()
+            logging.info("Файл-лок удалён")
+    except Exception as e:
+        logging.warning(f"Не удалось удалить файл-лок: {e}")
 
 # ----------------------------------------------------------------------
 # Главная функция
@@ -2854,6 +2899,7 @@ def main():
 
     hotkey_manager.stop_listeners()
     core.shutdown()
+    _release_lock()
     logging.info("Программа завершена")
     os._exit(0)
 
