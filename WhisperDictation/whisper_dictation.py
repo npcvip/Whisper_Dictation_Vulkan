@@ -11,7 +11,7 @@
 #   DEFAULT_MODEL = "models\\ggml-large-v3-turbo-q5_0.bin"
 # Версия 2 (продвинутая модель):
 #   DEFAULT_MODEL = "models\\ggml-large-v3-turbo-q8_0.bin"
-DEFAULT_MODEL = "models\\ggml-large-v3-turbo-q5_0.bin"
+DEFAULT_MODEL = "models\\ggml-large-v3-turbo-q8_0.bin"
 
 import sys
 import os
