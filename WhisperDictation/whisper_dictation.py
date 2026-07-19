@@ -4,6 +4,15 @@
 # Created: 2026
 # License: MIT
 
+# ======================================================================
+# МОДЕЛЬ ПО УМОЛЧАНИЮ — меняй здесь для разных версий программы
+# ======================================================================
+# Версия 1 (лёгкая модель):
+#   DEFAULT_MODEL = "models\\ggml-large-v3-turbo-q5_0.bin"
+# Версия 2 (продвинутая модель):
+#   DEFAULT_MODEL = "models\\ggml-large-v3-turbo-q8_0.bin"
+DEFAULT_MODEL = "models\\ggml-large-v3-turbo-q5_0.bin"
+
 import sys
 import os
 import wave
@@ -92,16 +101,7 @@ RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 CHUNK_DIR.mkdir(parents=True, exist_ok=True)
 
 # ----------------------------------------------------------------------
-# Очистка логов при запуске
-# ----------------------------------------------------------------------
-if LOG_PATH.exists():
-    try:
-        LOG_PATH.unlink()
-    except Exception:
-        pass
-
-# ----------------------------------------------------------------------
-# Логирование (ПОСЛЕ создания папок)
+# Конфигурация (относительные пути)
 # ----------------------------------------------------------------------
 logging.basicConfig(
     filename=LOG_PATH,
@@ -145,7 +145,7 @@ DEFAULT_CONFIG = {
     "Paths": {
         "whisper_gpu": "whisper-vulkan\\whisper-cli.exe",
         "whisper_cpu": "whisper-CPU\\whisper-cli.exe",
-        "model": "models\\ggml-large-v3-turbo-q8_0.bin",
+        "model": DEFAULT_MODEL,
         "gpu_device_index": "1",
         "server_gpu_path": "whisper-vulkan-Server\\whisper-server.exe",
         "server_cpu_path": "whisper-CPU\\whisper-server.exe",
@@ -171,6 +171,9 @@ DEFAULT_CONFIG = {
     "Hotkeys": {
         "hotkey": "middle_mouse",
         "hold_mode": "true",
+    },
+    "App": {
+        "paused": "false",
     },
 }
 
@@ -329,7 +332,7 @@ class TenVAD:
 # Whisper Runner (поддерживает whisper-cli и whisper-server с автозапуском)
 # ----------------------------------------------------------------------
 class WhisperRunner:
-    def __init__(self, config):
+    def __init__(self, config, paused=False):
         self.config = config
         self.method = config["Recognition"].get("method", "whisper-cli")
         self.server_url = config["Recognition"].get("server_url", "http://127.0.0.1:18877/inference")
@@ -340,7 +343,11 @@ class WhisperRunner:
         self._prev_model = resolve_path(self.config["Paths"]["model"])  # для отслеживания смены модели
         self._prev_gpu_idx = self.config["Paths"].get("gpu_device_index", "1")  # для отслеживания смены GPU
         self.update_paths()
-        self._auto_start_server_if_needed()
+        # Не запускаем сервер, если программа на паузе (модель не занимает GPU)
+        if not paused:
+            self._auto_start_server_if_needed()
+        else:
+            logging.info("Сервер не запущен: программа на паузе")
 
     def _auto_start_server_if_needed(self):
         """Если выбран метод whisper-server, запускает сервер и ждёт его готовности."""
@@ -642,10 +649,10 @@ class WhisperRunner:
 # Ядро диктовки
 # ----------------------------------------------------------------------
 class DictationCore:
-    def __init__(self, config):
+    def __init__(self, config, paused=False):
         self.config = config
         self.audio = AudioRecorder(config)
-        self.runner = WhisperRunner(config)
+        self.runner = WhisperRunner(config, paused=paused)
         self.recording_thread = None
         self.stop_event = threading.Event()
         self.mode = config["Recognition"]["mode"]
@@ -2464,15 +2471,18 @@ class TrayIcon:
         self.config = config
         self.hotkey_manager = hotkey_manager
         self.root = root
-        self.paused = False
         self.settings_window = None
         self.audio_file_window = None
 
-        # Проверка микрофона при старте
+        # Восстанавливаем состояние паузы из конфига
+        self.paused = config.getboolean("App", "paused", fallback=False)
+
+        # Если нет микрофона — тоже ставим на паузу (приоритет)
         if not core.audio.mic_available:
             self.paused = True
-            self.hotkey_manager.paused = True
             logging.warning("Микрофон не найден — программа запущена в режиме паузы")
+
+        self.hotkey_manager.paused = self.paused
 
         self.icon = pystray.Icon("whisper_dictation")
         self.icon.icon = self._create_image(active=not self.paused)
@@ -2480,9 +2490,12 @@ class TrayIcon:
         self._setup_menu()
         self.icon.on_click = self._on_click
 
-        # Показать уведомление если нет микрофона
-        if not core.audio.mic_available:
+        # Уведомления при старте
+        if self.paused and not core.audio.mic_available:
             self._show_toast("Микрофон не найден", "Программа в режиме паузы. Нажмите правую кнопку мыши на иконке для настроек.", duration=3)
+        elif self.paused:
+            self._show_toast("Пауза восстановлена", "Программа запущена в режиме паузы (предыдущее состояние). Нажмите на иконку для продолжения.", duration=2)
+            logging.info("Состояние паузы восстановлено из конфига")
 
     def _show_toast(self, title, message, duration=0.5):
         """Показывает всплывающее уведомление (тоаст) с автозакрытием."""
@@ -2535,23 +2548,38 @@ class TrayIcon:
         window.destroy()
         self.audio_file_window = None
 
+    def _save_paused_state(self):
+        """Сохраняет состояние паузы в конфиг."""
+        self.config["App"]["paused"] = str(self.paused).lower()
+        save_config(self.config)
+
     def _check_mic_and_resume(self, icon):
         """Проверяет микрофон перед снятием паузы. Если найден — снимает с паузы."""
         try:
             p = pyaudio.PyAudio()
             p.get_default_input_device_info()
             p.terminate()
-            # Микрофон найден
-            self.paused = False
-            self.hotkey_manager.paused = False
-            icon.icon = self._create_image(active=True)
-            icon.title = "Whisper Dictation"
-            self._show_toast("Микрофон найден", "Программа готова к работе. Нажмите среднюю кнопку мыши для начала диктовки.", duration=2)
-            logging.info("Микрофон найден, пауза снята")
         except Exception as e:
             # Микрофон не найден — остаёмся на паузе
             self._show_toast("Микрофон не найден", "Подключите микрофон или выберите его по умолчанию в настройках Windows.", duration=2)
             logging.warning(f"Микрофон не найден при снятии паузы: {e}")
+            return
+
+        # Микрофон найден — снимаем паузу
+        self.paused = False
+        self.hotkey_manager.paused = False
+        self._save_paused_state()
+        icon.icon = self._create_image(active=True)
+        icon.title = "Whisper Dictation"
+
+        # Запускаем сервер, если метод whisper-server
+        method = self.config.get("Recognition", "method", fallback="whisper-cli")
+        if method == "whisper-server":
+            logging.info("Снятие паузы: запуск сервера...")
+            self.core.runner._auto_start_server_if_needed()
+
+        self._show_toast("Пауза снята", "Программа готова к работе. Нажмите среднюю кнопку мыши для начала диктовки.", duration=1)
+        logging.info("Пауза снята")
 
     def _toggle_pause(self, icon, item):
         if self.paused:
@@ -2560,8 +2588,17 @@ class TrayIcon:
         else:
             self.paused = True
             self.hotkey_manager.paused = True
+            self._save_paused_state()
             icon.icon = self._create_image(active=False)
             icon.title = "Whisper Dictation (Paused)"
+
+            # Останавливаем сервер при включении паузы (выгрузка модели из GPU)
+            method = self.config.get("Recognition", "method", fallback="whisper-cli")
+            if method == "whisper-server":
+                logging.info("Включение паузы: остановка сервера (выгрузка модели из GPU)...")
+                self.core.runner._stop_server()
+
+            self._show_toast("Пауза включена", "Модель выгружена из памяти. Нажмите на иконку для продолжения.", duration=1)
             logging.info("Пауза включена")
 
     def _on_click(self, icon, pos, button, action):
@@ -2571,9 +2608,17 @@ class TrayIcon:
             else:
                 self.paused = True
                 self.hotkey_manager.paused = True
+                self._save_paused_state()
                 icon.icon = self._create_image(active=False)
                 icon.title = "Whisper Dictation (Paused)"
-                logging.info("Пауза включена")
+
+                # Останавливаем сервер при включении паузы
+                method = self.config.get("Recognition", "method", fallback="whisper-cli")
+                if method == "whisper-server":
+                    logging.info("Включение паузы (клик): остановка сервера...")
+                    self.core.runner._stop_server()
+
+                logging.info("Пауза включена (клик)")
 
     def _on_settings(self, icon, item):
         if self.settings_window is not None:
@@ -2678,6 +2723,69 @@ def clean_old_files():
         logging.info("Очистка при старте: временных файлов не найдено")
 
 # ----------------------------------------------------------------------
+# Проверка наличия модели при запуске
+# ----------------------------------------------------------------------
+def _ensure_model_available(config, root):
+    """Проверяет, что модель доступна. Если нет — пытается DEFAULT_MODEL, затем просит пользователя."""
+    model_path_str = config["Paths"]["model"]
+    model_path = resolve_path(model_path_str)
+
+    # Модель из конфига найдена — всё OK
+    if os.path.isfile(model_path):
+        return
+
+    # Модель из конфига не найдена — пробуем DEFAULT_MODEL
+    default_model_path = resolve_path(DEFAULT_MODEL)
+    if os.path.isfile(default_model_path):
+        config["Paths"]["model"] = DEFAULT_MODEL
+        save_config(config)
+        logging.info(f"Модель из конфига не найдена ({model_path_str}), использована DEFAULT_MODEL: {DEFAULT_MODEL}")
+        try:
+            messagebox.showinfo(
+                "Модель по умолчанию",
+                f"Модель из настроек не найдена:\n{model_path_str}\n\n"
+                f"Использована модель по умолчанию:\n{DEFAULT_MODEL}"
+            )
+        except Exception:
+            pass
+        return
+
+    # Ни одна модель не найдена — сообщаем пользователю и предлагаем выбрать
+    messagebox.showerror(
+        "Модель не найдена",
+        "Модель Whisper не найдена!\n\n"
+        "Модель не найдена ни в настройках:\n"
+        f"  {model_path_str}\n\n"
+        "Ни модель по умолчанию:\n"
+        f"  {DEFAULT_MODEL}\n\n"
+        "Для работы программы требуется файл модели (.bin).\n"
+        "Пожалуйста, укажите путь к модели."
+    )
+
+    # Диалог выбора модели
+    from tkinter import filedialog
+    file_path = filedialog.askopenfilename(
+        title="Выберите модель Whisper (.bin)",
+        filetypes=[("Модели Whisper", "*.bin"), ("Все файлы", "*.*")],
+        initialdir=str(RESOURCE_DIR / "models")
+    )
+
+    if not file_path:
+        messagebox.showerror("Ошибка", "Модель не выбрана. Программа не может работать без модели. Завершение.")
+        logging.error("Модель не выбрана пользователем — выход")
+        sys.exit(1)
+
+    # Проверка расширения
+    if not file_path.lower().endswith(".bin"):
+        messagebox.showerror("Ошибка", "Выбранный файл не является моделью Whisper (требуется .bin).")
+        sys.exit(1)
+
+    # Сохраняем выбранный путь в конфиг
+    config["Paths"]["model"] = file_path
+    save_config(config)
+    logging.info(f"Модель выбрана пользователем: {file_path}")
+
+# ----------------------------------------------------------------------
 # Защита от запуска второй копии
 # ----------------------------------------------------------------------
 def _ensure_single_instance():
@@ -2719,7 +2827,16 @@ def main():
     # Полная очистка временных файлов при запуске
     clean_old_files()
     config = load_config()
-    core = DictationCore(config)
+
+    # Проверка наличия модели (нужен tk для диалогов)
+    _root = tk.Tk()
+    _root.withdraw()
+    _ensure_model_available(config, _root)
+    _root.destroy()
+
+    # Восстанавливаем состояние паузы
+    was_paused = config.getboolean("App", "paused", fallback=False)
+    core = DictationCore(config, paused=was_paused)
     hotkey_manager = HotkeyManager(core, config)
     hotkey_manager.start_listeners()
 
