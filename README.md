@@ -282,6 +282,9 @@ MIT License
 | **whisper-vulkan-win-x64 (серверная сборка)** | Vulkan-сборка `whisper-server.exe` — запускает сервер, который держит модель в памяти GPU для быстрых повторных запросов | [github.com/p3k22/whisper-vulkan-win-x64](https://github.com/p3k22/whisper-vulkan-win-x64) |
 | **whisper-windows-mcp (клиентская сборка)** | Vulkan-сборка `whisper-cli.exe` — разовая транскрипция аудиофайлов, не держит модель в памяти, используется как резервный режим | [github.com/eviscerations/whisper-windows-mcp/releases/tag/v1.4.0](https://github.com/eviscerations/whisper-windows-mcp/releases/tag/v1.4.0) |
 | **Модели Whisper (GGML)** | Квантованные модели Whisper в формате GGML для использования с whisper.cpp | [huggingface.co/ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp) |
+| **Ten VAD** | Нейросетевой детектор голосовой активности с низкой задержкой и высокой точностью (использовался как внешний VAD) | [github.com/TEN-framework/ten-vad](https://github.com/TEN-framework/ten-vad) |
+| **Silero VAD** | Предобученный детектор голосовой активности, используемый внутри whisper.cpp (внутренний VAD) | [github.com/snakers4/silero-vad](https://github.com/snakers4/silero-vad) |
+| **sherpa-onnx** | Библиотека для запуска Ten VAD в реальном времени (использовалась как внешний VAD) | [github.com/k2-fsa/sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) |
 | **PyAudio** | Python-обёртка для PortAudio — захват звука с микрофона | [people.csail.mit.edu/hubert/pyaudio](https://people.csail.mit.edu/hubert/pyaudio) |
 | **Pynput** | Перехват событий мыши и клавиатуры для горячих клавиш | [github.com/moses-palmer/pynput](https://github.com/moses-palmer/pynput) |
 | **PyStray** | Создание иконки в системном трее | [github.com/moses-palmer/pystray](https://github.com/moses-palmer/pystray) |
