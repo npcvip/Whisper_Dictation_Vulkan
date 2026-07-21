@@ -270,3 +270,33 @@ MIT License
 ---
 
 *Этот проект — результат доработки и оптимизации для максимальной скорости работы на современных GPU. Приветствуются любые предложения и улучшения!*
+
+## 📚 Благодарности и использованные проекты
+
+Этот проект был бы невозможен без этих замечательных открытых проектов:
+
+| Проект | Описание | Ссылка |
+|--------|----------|--------|
+| **Whisper.cpp** | Высокопроизводительная реализация Whisper на C++ с поддержкой CPU и GPU (Vulkan, CUDA, Metal) | [github.com/ggml-org/whisper.cpp](https://github.com/ggml-org/whisper.cpp) |
+| **Whisper (OpenAI)** | Оригинальная модель распознавания речи от OpenAI | [github.com/openai/whisper](https://github.com/openai/whisper) |
+| **whisper-vulkan-win-x64 (серверная сборка)** | Vulkan-сборка `whisper-server.exe` — запускает сервер, который держит модель в памяти GPU для быстрых повторных запросов | [github.com/p3k22/whisper-vulkan-win-x64](https://github.com/p3k22/whisper-vulkan-win-x64) |
+| **whisper-windows-mcp (клиентская сборка)** | Vulkan-сборка `whisper-cli.exe` — разовая транскрипция аудиофайлов, не держит модель в памяти, используется как резервный режим | [github.com/eviscerations/whisper-windows-mcp/releases/tag/v1.4.0](https://github.com/eviscerations/whisper-windows-mcp/releases/tag/v1.4.0) |
+| **Модели Whisper (GGML)** | Квантованные модели Whisper в формате GGML для использования с whisper.cpp | [huggingface.co/ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp) |
+| **PyAudio** | Python-обёртка для PortAudio — захват звука с микрофона | [people.csail.mit.edu/hubert/pyaudio](https://people.csail.mit.edu/hubert/pyaudio) |
+| **Pynput** | Перехват событий мыши и клавиатуры для горячих клавиш | [github.com/moses-palmer/pynput](https://github.com/moses-palmer/pynput) |
+| **PyStray** | Создание иконки в системном трее | [github.com/moses-palmer/pystray](https://github.com/moses-palmer/pystray) |
+| **PyAutoGUI** | Эмуляция нажатий клавиш для вставки текста | [github.com/asweigart/pyautogui](https://github.com/asweigart/pyautogui) |
+| **Pyperclip** | Работа с буфером обмена | [github.com/asweigart/pyperclip](https://github.com/asweigart/pyperclip) |
+| **PyDub** | Работа с аудиофайлами (конвертация форматов) | [github.com/jiaaro/pydub](https://github.com/jiaaro/pydub) |
+| **FFmpeg** | Конвертация аудио между форматами | [ffmpeg.org](https://ffmpeg.org) |
+| **Vulkan** | Кросс-платформенный API для GPU-ускорения | [vulkan.org](https://www.vulkan.org) |
+| **Inno Setup** | Создание установщика для Windows | [jrsoftware.org/isinfo.php](https://jrsoftware.org/isinfo.php) |
+
+### 🙏 Спасибо
+
+Особая благодарность:
+- **ggerganov** и сообществу `whisper.cpp` за возможность использовать мощь Whisper на обычных компьютерах без облачных сервисов.
+- **p3k22** за серверную Vulkan-сборку `whisper.cpp` (`whisper-server.exe`).
+- **eviscerations** за клиентскую Vulkan-сборку (`whisper-cli.exe`).
+
+Если вы хотите поддержать проекты, поставьте им звёзды на GitHub! ⭐
